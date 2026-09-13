@@ -4,6 +4,8 @@ A 13-button keypad for a handheld implement control grip. It has its own PCA9555
 
 The schematic and EasyEDA project call this board **Joystick Front**.
 
+<img src="handgrip.jpg" alt="Assembled Handgrip keypad PCB with numbered buttons" width="480">
+
 > The button layout is inspired by the HARDI NOVA sprayer grip. This project is not affiliated with or endorsed by HARDI. HARDI and NOVA are trademarks of their respective owners.
 
 ## Connector

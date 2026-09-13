@@ -2,6 +2,8 @@
 
 The central board that every AgIsoAuxInputs device runs on. It connects to the tractor's power and ISOBUS. Keypads and joysticks connect to it.
 
+![Brain board fitted in a 3D-printed housing](brain.jpg)
+
 ## Features
 
 - **Power**: 9-16 V input with reverse-polarity protection (MOSFET ideal diode, NCV68061). A TPS5430 buck converter makes 5 V and an AMS1117 makes 3.3 V. The board can also be powered from USB-C.
@@ -9,17 +11,19 @@ The central board that every AgIsoAuxInputs device runs on. It connects to the t
 - **On-board inputs**: ADS1115 4-channel ADC and a PCA9555 I/O expander (0x20). A device can be built on a breadboard with only buttons, switches and potentiometers.
 - **I2C to keypads**: PCA9306 level shifter between the 3.3 V ESP32 and the 5 V keypad bus.
 - **Switch output**: optocoupler (EL3H7) driven by GPIO18.
+- **RST and BOOT buttons**, and power LEDs for 12 V, 5 V and 3.3 V.
 
 ## Connectors
 
+Names in quotes are the silkscreen labels.
+
 | Connector | Pins |
 |---|---|
-| WAGO terminals | 9-16V, GND, CAN_H, CAN_L, SWITCH, SWITCH_GND |
+| WAGO terminals | 9-16V, GND, CAN_H, CAN_L, SW, SW GND |
 | USB-C | Power, programming, serial log |
-| H4 (pots) | 5V, GND, POT1-POT4 |
-| H5 (buttons) | BTN0-BTN3, LED1, GND |
-| H6 (buttons) | BTN4-BTN7, LED2, GND |
-| H1 (I2C) | 5V, SDA, SCL |
+| "4xJoystick" (H4) | +5V, GND, POT1-POT4 |
+| "8xButton" (H5, H6) | BTN0-BTN3, LED, GND and BTN4-BTN7, LED, GND |
+| UART / I2C header | RX, TX, 3V3, GND, SCL, SDA, 5V (I2C at 5 V, to keypads) |
 | H7 | GPIO7, GPIO8, GPIO9 (220 Ω series) |
 
 ## Files

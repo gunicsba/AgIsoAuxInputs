@@ -4,6 +4,17 @@ Open-source ISOBUS **auxiliary input devices** (ISO 11783-6 AUX-N): joysticks, k
 
 Built on [AgIsoStack++](https://github.com/Open-Agriculture/AgIsoStack-plus-plus). Not affiliated with Open-Agriculture.
 
+<table>
+  <tr>
+    <td align="center"><a href="hardware/enclosures/handgrip/"><img src="hardware/enclosures/handgrip/handgrip_enclosure.png" alt="Handgrip" height="280"></a><br>Handgrip</td>
+    <td align="center"><a href="hardware/boards/handgrip/"><img src="hardware/boards/handgrip/handgrip.jpg" alt="Handgrip keypad PCB" height="280"></a><br>Handgrip keypad PCB</td>
+    <td align="center"><a href="hardware/enclosures/jh-d400x/"><img src="hardware/enclosures/jh-d400x/jh-d400x_enclosure.png" alt="JH-D400X joystick housing" height="280"></a><br>JH-D400X joystick housing</td>
+  </tr>
+  <tr>
+    <td align="center" colspan="3"><a href="hardware/boards/brain/"><img src="hardware/boards/brain/brain.jpg" alt="Brain board" width="640"></a><br>Brain board</td>
+  </tr>
+</table>
+
 ## Status
 
 | Device | State |
