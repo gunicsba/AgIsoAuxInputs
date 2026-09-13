@@ -1,6 +1,10 @@
-# Joystick Front keypad V1.0
+# Handgrip keypad V1.0
 
-A 13-button keypad for a handheld joystick. It has its own PCA9555 and connects to the [brain board](../brain/) over I2C.
+A 13-button keypad for a handheld implement control grip. It has its own PCA9555 and connects to the [brain board](../brain/) over I2C.
+
+The schematic and EasyEDA project call this board **Joystick Front**.
+
+> The button layout is inspired by the HARDI NOVA sprayer grip. This project is not affiliated with or endorsed by HARDI. HARDI and NOVA are trademarks of their respective owners.
 
 ## Connector
 
@@ -43,9 +47,9 @@ The number printed next to each button on the silkscreen is its PCA9555 bit (sil
 
 | File | Use |
 |---|---|
-| `Gerber_joystick_front.zip` | PCB fabrication |
-| `BOM_joystick_front.xlsx` | Bill of materials (LCSC part numbers) |
-| `PickAndPlace_joystick_front.xlsx` | Component placement for assembly |
+| `Gerber_handgrip.zip` | PCB fabrication |
+| `BOM_handgrip.xlsx` | Bill of materials (LCSC part numbers) |
+| `PickAndPlace_handgrip.xlsx` | Component placement for assembly |
 | `schematic.pdf` | Pages 1-2 are this board (in the repo: `hardware/schematic.pdf`) |
 
-The matching handheld housing is in [enclosures/joystick_front](../../enclosures/joystick_front/).
+The matching housing is in [enclosures/handgrip](../../enclosures/handgrip/).

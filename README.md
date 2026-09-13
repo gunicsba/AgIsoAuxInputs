@@ -18,11 +18,11 @@ One central **brain board** handles power, CAN and the ISOBUS stack. **Keypads**
 | Part | What it is |
 |---|---|
 | [Brain board](hardware/boards/brain/) | ESP32-S3, 9-16 V supply with reverse-polarity protection, CAN transceiver, 4-channel ADC and a 16-pin I/O expander on board. It works on its own on a breadboard with plain buttons, switches and pots |
-| [Joystick Front keypad](hardware/boards/joystick_front/) | 13-button keypad with its own PCA9555, connected over I2C |
+| [Handgrip keypad](hardware/boards/handgrip/) | 13-button keypad for a handheld control grip, with its own PCA9555, connected over I2C. Layout inspired by the HARDI NOVA sprayer grip |
 | [JH-D400X housing](hardware/enclosures/jh-d400x/) | 3D-printed housing for the JH-D400X 4-axis joystick module |
-| [Joystick Front housing](hardware/enclosures/joystick_front/) | 3D-printed handheld grip for the Joystick Front keypad |
+| [Handgrip housing](hardware/enclosures/handgrip/) | 3D-printed handheld grip for the Handgrip keypad |
 
-[hardware/schematic.pdf](hardware/schematic.pdf) covers both boards: pages 1-2 are the Joystick Front, pages 3-7 the brain board.
+[hardware/schematic.pdf](hardware/schematic.pdf) covers both boards: pages 1-2 are the Handgrip keypad (titled "Joystick Front"), pages 3-7 the brain board.
 
 ### Downloads
 
@@ -41,10 +41,10 @@ git push origin v1.0.0
 
 ### Joystick
 
-Brain board + JH-D400X module + Joystick Front keypad.
+Brain board + JH-D400X module + Handgrip keypad.
 
 - 4 ADS1115 channels are sent as analog AUX-N inputs (function type "analogue, maintains position"), labelled `A1`-`A4`.
-- 16 keypad PCA9555 pins are sent as momentary boolean AUX-N inputs. The bit number equals the silkscreen number next to each button; see the [keypad README](hardware/boards/joystick_front/#buttons) for positions and labels.
+- 16 keypad PCA9555 pins are sent as momentary boolean AUX-N inputs. The bit number equals the silkscreen number next to each button; see the [Handgrip README](hardware/boards/handgrip/#buttons) for positions and labels.
 
 The brain board's own PCA9555 and the optocoupler output are not used by this firmware yet.
 
@@ -84,3 +84,5 @@ The ISOBUS NAME uses the placeholder manufacturer code `1407` (the one AgIsoStac
 ## License
 
 [WTFPL](LICENSE). AgIsoStack++ is MIT licensed.
+
+HARDI and NOVA are trademarks of their respective owners. They are mentioned only to credit design inspiration; this project is not affiliated with or endorsed by HARDI.
