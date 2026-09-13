@@ -35,6 +35,8 @@ One central **brain board** handles power, CAN and the ISOBUS stack. **Keypads**
 
 [hardware/schematic.pdf](hardware/schematic.pdf) covers both boards: pages 1-2 are the Handgrip keypad (titled "Joystick Front"), pages 3-7 the brain board.
 
+Both boards are also published as one open-source EasyEDA project on OSHWLab: [ESP32S3R8N8 CAN Board](https://oshwlab.com/gunicsba/esp32s3r8n8-can-board). Open it there to view or edit the design, or to order boards directly.
+
 ### Downloads
 
 Each [GitHub release](https://github.com/gunicsba/AgIsoAuxInputs/releases) has a separate ZIP per board and per enclosure (`AgIsoAuxInputs-<version>-board-brain.zip`, `...-enclosure-jh-d400x.zip`, ...), so you can download only what you need. Board ZIPs include the Gerbers, BOM, pick-and-place and schematic.
