@@ -1,0 +1,13 @@
+* text=auto
+
+# Hardware / binary assets - never line-ending convert
+*.pdf  binary
+*.zip  binary
+*.xlsx binary
+*.3mf  binary
+*.f3d  binary
+*.f3z  binary
+*.png  binary
+*.jpg  binary
+*.iop  binary
+*.bin  binary
