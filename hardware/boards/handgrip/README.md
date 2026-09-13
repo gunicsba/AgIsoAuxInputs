@@ -59,3 +59,5 @@ The matching housing is in [enclosures/handgrip](../../enclosures/handgrip/).
 ## Changes
 
 2026-09-13 - Added FASTLED compatible LEDs
+
+2026-09-13 - Parts shortage: replaced the SK6805-EC15 LEDs (LED1-LED6) with SK6805D-EC2018 (LCSC C5440835), which has a larger 2.0 x 1.8 mm footprint

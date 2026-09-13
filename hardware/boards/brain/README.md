@@ -6,7 +6,7 @@ The central board that every AgIsoAuxInputs device runs on. It connects to the t
 
 ## Features
 
-- **Power**: 9-16 V input with reverse-polarity protection (MOSFET ideal diode, NCV68061). A TPS5430 buck converter makes 5 V and an AMS1117 makes 3.3 V. The board can also be powered from USB-C.
+- **Power**: 9-16 V input with reverse-polarity protection (MOSFET ideal diode, LM74700-Q1). A TPS5430 buck converter makes 5 V and an AMS1117 makes 3.3 V. The board can also be powered from USB-C.
 - **CAN**: MCP2562 transceiver with PESD1CAN ESD protection (ESP32 TWAI on GPIO10/GPIO11).
 - **On-board inputs**: ADS1115 4-channel ADC and a PCA9555 I/O expander (0x20). A device can be built on a breadboard with only buttons, switches and potentiometers.
 - **I2C to keypads**: PCA9306 level shifter between the 3.3 V ESP32 and the 5 V keypad bus.
@@ -42,3 +42,5 @@ The EasyEDA design source is on OSHWLab: [ESP32S3R8N8 CAN Board](https://oshwlab
 ## Changes
 
 2026-09-13 - Added FASTLED compatible Output
+
+2026-09-13 - Parts shortage: replaced the NCV68061 ideal diode controller (U26) with a TI LM74700-Q1 (U7, LCSC C2941042) and added its 100nF capacitor (C3)

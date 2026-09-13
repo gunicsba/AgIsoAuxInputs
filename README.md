@@ -104,3 +104,5 @@ HARDI and NOVA are trademarks of their respective owners. They are mentioned onl
 ## Changes
 
 2026-09-13 - Added FASTLED driver to the brain and compatible LEDs to the joystick front 
+
+2026-09-13 - Parts shortage substitutions: brain board ideal diode controller is now an LM74700-Q1, handgrip LEDs are now SK6805D-EC2018
