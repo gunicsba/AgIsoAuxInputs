@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Builds the minimal ISO 11783-6 AUX-N object pool (.iop) for the joystick_aux_n
+Builds the minimal ISO 11783-6 AUX-N object pool (.iop) for the joystick
 firmware: one Working Set, one Data Mask showing "TEST", and one
 Auxiliary Input Type 2 object per physical input (4 analog channels + 16
 extender buttons) - each with a short text designator (e.g. "B1", "A1") so
@@ -17,10 +17,10 @@ Auxiliary Input designator... shall fit inside a Soft Key designator"), the
 designator child isn't restricted to picture graphics - a small OutputString
 is valid and much simpler than encoding bitmap icons.
 
-Run this script whenever object IDs/count/text need to change:
+Run this script (from firmware/) whenever object IDs/count/text need to change:
     python tools/build_aux_pool.py
-It (re)writes src/object_pool/aux_n_pool.iop and
-src/object_pool/object_pool_ids.h.
+It (re)writes src/object_pool/aux_n_pool.iop, src/object_pool/object_pool_ids.h
+and src/object_pool/aux_n_pool_data.h.
 """
 import pathlib
 import struct

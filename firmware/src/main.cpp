@@ -2,11 +2,10 @@
  * Joystick AUX-N - ESP32S3R8N8 CAN Board V1.0.0
  *
  * Real ISO 11783-6 AUX-N (Auxiliary Control Type 2) joystick, built on the
- * AgIsoStack-plus-plus ISOBUS library. Unlike the other firmware variants in
- * this repo, this speaks genuine ISOBUS, not the project's internal
- * proprietary CAN protocol - it can plug into any ISO 11783 network (a
- * tractor's VT, or AgOpenGPS's own VT) and have its inputs assigned to
- * implement functions through the VT's normal aux-assignment screen.
+ * AgIsoStack-plus-plus ISOBUS library. It can plug into any ISO 11783
+ * network (a tractor's VT, or AgOpenGPS's own VT) and have its inputs
+ * assigned to implement functions through the VT's normal aux-assignment
+ * screen.
  *
  * Object pool: one Working Set + one Data Mask showing "TEST" (enough to
  * confirm the pool uploaded), plus 20 Auxiliary Input Type 2 objects (4
@@ -15,9 +14,6 @@
  * both a standalone .iop file (for reference/upload tools) and the embedded
  * C byte array in object_pool/aux_n_pool_data.h that this file actually
  * compiles in.
- *
- * Hardware I/O (ADS1115 + PCA9555 reads) is the same driver code used by
- * joystick_full.cpp for the same physical board.
  */
 
 #include <Arduino.h>
