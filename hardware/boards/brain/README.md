@@ -38,3 +38,7 @@ Names in quotes are the silkscreen labels.
 To order: upload the Gerber ZIP to JLCPCB. For assembly, add the BOM and pick-and-place files.
 
 The EasyEDA design source is on OSHWLab: [ESP32S3R8N8 CAN Board](https://oshwlab.com/gunicsba/esp32s3r8n8-can-board).
+
+## Changes
+
+2026-09-13 - Added FASTLED compatible Output

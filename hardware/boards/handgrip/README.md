@@ -55,3 +55,7 @@ The number printed next to each button on the silkscreen is its PCA9555 bit (sil
 | `schematic.pdf` | Pages 1-2 are this board (in the repo: `hardware/schematic.pdf`) |
 
 The matching housing is in [enclosures/handgrip](../../enclosures/handgrip/).
+
+## Changes
+
+2026-09-13 - Added FASTLED compatible LEDs

@@ -99,3 +99,8 @@ The ISOBUS NAME uses the placeholder manufacturer code `1407` (the one AgIsoStac
 [WTFPL](LICENSE). AgIsoStack++ is MIT licensed.
 
 HARDI and NOVA are trademarks of their respective owners. They are mentioned only to credit design inspiration; this project is not affiliated with or endorsed by HARDI.
+
+
+## Changes
+
+2026-09-13 - Added FASTLED driver to the brain and compatible LEDs to the joystick front 
