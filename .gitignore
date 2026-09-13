@@ -10,3 +10,4 @@ firmware/dependencies.lock
 .vscode/launch.json
 .vscode/ipch
 firmware/.vscode/
+dist/

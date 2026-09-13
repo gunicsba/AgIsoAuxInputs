@@ -4,51 +4,49 @@ Open-source ISOBUS **auxiliary input devices** (ISO 11783-6 AUX-N): joysticks, k
 
 Built on [AgIsoStack++](https://github.com/Open-Agriculture/AgIsoStack-plus-plus). Not affiliated with Open-Agriculture.
 
-![Joystick](images/3D_joystick.png)
-
 ## Status
 
 | Device | State |
 |---|---|
-| Joystick (4 analog axes + buttons) | Working end-to-end on real hardware (ESP32-S3 + PCAN-USB + AgIsoVirtualTerminal): address claim, VT handshake, object pool upload and live aux input assignment |
-| Keypads, switch boxes, ... | Planned, same board |
+| Joystick: 4 analog axes + 13 buttons | Working end-to-end on real hardware (ESP32-S3 + PCAN-USB + AgIsoVirtualTerminal): address claim, VT handshake, object pool upload and live aux input assignment |
+| Other keypads, switch boxes, ... | Planned, same brain board |
 
 ## Hardware
 
-Every device runs on the same board: the **ESP32S3R8N8 CAN Board V1.0.0**. It has its own power supply with reverse-polarity protection, a CAN transceiver, an ADC and I/O expanders on board. A device can be built on a breadboard with nothing more than buttons, switches and potentiometers. If a device needs more inputs, add more I2C chips.
+One central **brain board** handles power, CAN and the ISOBUS stack. **Keypads** and joystick modules connect to it, so you build only the boards your device needs.
 
-| Function | Part | Connection |
-|---|---|---|
-| MCU | ESP32-S3 (ESP32S3R8N8, 8 MB flash) | |
-| CAN | ESP32 TWAI + transceiver | TX GPIO10, RX GPIO11, 250 kbit/s |
-| I2C bus | | SDA GPIO39, SCL GPIO38, 400 kHz |
-| Analog inputs | ADS1115 | 0x48, 4 channels |
-| Digital I/O (main) | PCA9555 | 0x20 |
-| Digital I/O (extender) | PCA9555 | 0x21-0x23 (auto-detected), 16 pins |
-| Status LEDs | | GPIO48, GPIO47 |
-| Optocoupler output | | GPIO18 |
+| Part | What it is |
+|---|---|
+| [Brain board](hardware/boards/brain/) | ESP32-S3, 9-16 V supply with reverse-polarity protection, CAN transceiver, 4-channel ADC and a 16-pin I/O expander on board. It works on its own on a breadboard with plain buttons, switches and pots |
+| [Joystick Front keypad](hardware/boards/joystick_front/) | 13-button keypad with its own PCA9555, connected over I2C |
+| [JH-D400X housing](hardware/enclosures/jh-d400x/) | 3D-printed housing for the JH-D400X 4-axis joystick module |
+| [Joystick Front housing](hardware/enclosures/joystick_front/) | 3D-printed handheld grip for the Joystick Front keypad |
 
-[hardware/](hardware/) contains the schematic, Gerbers, BOM and pick-and-place files. [hardware/3d/](hardware/3d/) contains the joystick housing and button models.
+[hardware/schematic.pdf](hardware/schematic.pdf) covers both boards: pages 1-2 are the Joystick Front, pages 3-7 the brain board.
+
+### Downloads
+
+Each [GitHub release](https://github.com/gunicsba/AgIsoAuxInputs/releases) has a separate ZIP per board and per enclosure (`AgIsoAuxInputs-<version>-board-brain.zip`, `...-enclosure-jh-d400x.zip`, ...), so you can download only what you need. Board ZIPs include the Gerbers, BOM, pick-and-place and schematic.
+
+To publish a release, push a tag:
+
+```sh
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+[tools/package_release.py](tools/package_release.py) builds the same ZIPs locally into `dist/`.
 
 ## Devices
 
 ### Joystick
 
+Brain board + JH-D400X module + Joystick Front keypad.
+
 - 4 ADS1115 channels are sent as analog AUX-N inputs (function type "analogue, maintains position"), labelled `A1`-`A4`.
-- 16 extender PCA9555 pins are sent as momentary boolean AUX-N inputs, labelled after where the button sits on the joystick:
+- 16 keypad PCA9555 pins are sent as momentary boolean AUX-N inputs. The bit number equals the silkscreen number next to each button; see the [keypad README](hardware/boards/joystick_front/#buttons) for positions and labels.
 
-| Bit | Label | Bit | Label |
-|---|---|---|---|
-| 0 | `X0` (spare) | 8 | `DR-` |
-| 1 | `DL+` | 9 | `DR+` |
-| 2 | `DL-` | 10 | `T4` |
-| 3 | `ML` | 11 | `T3` |
-| 4 | `MD` | 12 | `T2` |
-| 5 | `MR` | 13 | `T1` |
-| 6 | `MC` | 14 | `X14` (spare) |
-| 7 | `MU` | 15 | `X15` (spare) |
-
-The main PCA9555 and the optocoupler output are not used by this firmware yet.
+The brain board's own PCA9555 and the optocoupler output are not used by this firmware yet.
 
 ## Build & flash
 
@@ -79,8 +77,9 @@ The ISOBUS NAME uses the placeholder manufacturer code `1407` (the one AgIsoStac
 ## Roadmap
 
 - **Device profiles**: describe each device's inputs (source chip/pin, AUX-N function type, label) in one file per device. The object pool and the input mapping are generated from it, so a new keypad only needs a new profile.
-- Use the main PCA9555 and skip unwired inputs.
+- Use the brain board's PCA9555 and skip unwired inputs.
 - Configurable NAME function instance, so several devices can share one bus.
+- Attach firmware binaries to releases.
 
 ## License
 
