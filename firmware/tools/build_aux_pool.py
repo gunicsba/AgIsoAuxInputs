@@ -92,8 +92,12 @@ TYPE_AUXILIARY_INPUT_TYPE_2 = 32
 DESIGNATOR_FONT_SIZE_ENUM = 4  # FontSize::Size16x16
 DESIGNATOR_CHAR_W = 16
 DESIGNATOR_BOX = 60
-# justification bitfield: bits0-1 horizontal (1=middle), bits2-3 vertical (1=middle)
-JUSTIFY_CENTERED = 0b0101
+# justification bitfield: bits0-1 horizontal (1=middle), bits2-3 vertical
+# (0=top, 1=middle). Vertical-middle (0b0101) rendered fine on
+# AgIsoVirtualTerminal but Mueller's VT3 rejected the pool with it set;
+# horizontal-middle/vertical-top (0b0001) is what a real-hardware test
+# against VT3 used instead.
+JUSTIFY_CENTERED = 0b0001
 
 
 def u16(v):
