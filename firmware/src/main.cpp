@@ -18,6 +18,7 @@
 
 #include <Arduino.h>
 #include <Wire.h>
+#include <cstring>
 #include <Adafruit_ADS1X15.h>
 #include "esp_log.h"
 
@@ -31,6 +32,7 @@
 #include "isobus/utility/iop_file_interface.hpp"
 
 #include "object_pool/aux_n_pool_data.h"
+#include "object_pool/aux_n_pool_justify.h"
 #include "object_pool/object_pool_ids.h"
 
 #if defined(ENABLE_OTA_WEBSERVER)
@@ -79,6 +81,13 @@ static ArduinoCANStackLogger canStackLogger;
 static Adafruit_ADS1115 ads;
 static std::shared_ptr<isobus::VirtualTerminalClient> vtClient = nullptr;
 static std::shared_ptr<isobus::InternalControlFunction> internalECU = nullptr;
+
+// Mutable RAM copy of AUX_N_POOL_DATA: set_object_pool() reads from this
+// pointer lazily as the pool uploads, so patching justification below (once
+// the connected VT's version is known) has to happen on a writable buffer,
+// not the const embedded array.
+static uint8_t auxPoolBuffer[AUX_N_POOL_SIZE];
+static bool auxPoolJustificationChecked = false;
 
 static uint16_t analogValues[NUM_AUX_ANALOG] = {0};
 static bool buttonStates[NUM_AUX_BUTTONS] = {false};
@@ -237,7 +246,8 @@ static void setupIsobus() {
   // silently keep serving its old cached pool.
   std::string poolVersion = isobus::IOPFileInterface::hash_object_pool_to_version(
       AUX_N_POOL_DATA, AUX_N_POOL_SIZE);
-  vtClient->set_object_pool(0, AUX_N_POOL_DATA, AUX_N_POOL_SIZE, poolVersion);
+  memcpy(auxPoolBuffer, AUX_N_POOL_DATA, AUX_N_POOL_SIZE);
+  vtClient->set_object_pool(0, auxPoolBuffer, AUX_N_POOL_SIZE, poolVersion);
   vtClient->set_auxiliary_input_model_identification_code(1);
   for (uint8_t i = 0; i < NUM_AUX_ANALOG; i++) {
     vtClient->add_auxiliary_input_object_id(AUX_ANALOG_IDS[i]);
@@ -246,6 +256,39 @@ static void setupIsobus() {
     vtClient->add_auxiliary_input_object_id(AUX_BUTTON_IDS[i]);
   }
   vtClient->initialize(true);
+}
+
+// The pool ships with the VT3-safe designator justification baked in
+// (vertical justification bits are reserved on VT3 and older, and a
+// VT3/Mueller unit rejected the pool outright with them set - see
+// JUSTIFY_CENTERED in tools/build_aux_pool.py). Once we know the connected
+// VT actually supports version 4+, upgrade those bytes in place to get
+// proper vertical centering on VTs that support it. connectedVTVersion
+// becomes known from the Get Memory response, well before the pool upload
+// state begins, so patching the buffer here always lands before any of it
+// is actually sent.
+static void checkAndUpgradeAuxPoolJustification() {
+  if (auxPoolJustificationChecked)
+    return;
+
+  auto vtVersion = vtClient->get_connected_vt_version();
+  if (isobus::VirtualTerminalClient::VTVersion::ReservedOrUnknown == vtVersion)
+    return; // not connected far enough yet to know the VT's version
+
+  auxPoolJustificationChecked = true;
+
+  switch (vtVersion) {
+    case isobus::VirtualTerminalClient::VTVersion::Version4:
+    case isobus::VirtualTerminalClient::VTVersion::Version5:
+    case isobus::VirtualTerminalClient::VTVersion::Version6:
+      for (uint32_t i = 0; i < AUX_N_POOL_JUSTIFY_OFFSET_COUNT; i++) {
+        auxPoolBuffer[AUX_N_POOL_JUSTIFY_OFFSETS[i]] = AUX_N_POOL_JUSTIFY_VT4_ENHANCED;
+      }
+      Serial.println("[AUX-N] VT reports version 4+: upgraded designator justification");
+      break;
+    default:
+      break; // VT3 or older: leave the shipped VT3-safe justification as-is
+  }
 }
 
 #if defined(ENABLE_OTA_WEBSERVER)
@@ -357,6 +400,7 @@ void loop() {
   // state machine (VT handshake, object pool upload, ...).
   isobus::CANHardwareInterface::update();
   vtClient->update();
+  checkAndUpgradeAuxPoolJustification();
 
   uint32_t now = millis();
   if (now - lastPollTime >= POLL_INTERVAL_MS) {
