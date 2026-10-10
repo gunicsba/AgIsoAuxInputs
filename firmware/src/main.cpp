@@ -34,8 +34,10 @@
 #include "isobus/utility/iop_file_interface.hpp"
 
 #include "git_version.h"
+#include "aux_buttons.h"
 #include "lights.h"
 #include "object_pool/aux_n_pool_data.h"
+#include "settings.h"
 #include "object_pool/object_pool_ids.h"
 
 #if defined(ENABLE_OTA_WEBSERVER)
@@ -110,8 +112,7 @@ static std::shared_ptr<isobus::VirtualTerminalClient> vtClient = nullptr;
 static std::shared_ptr<isobus::InternalControlFunction> internalECU = nullptr;
 
 static uint16_t analogValues[NUM_AUX_ANALOG] = {0};
-static bool buttonStates[NUM_AUX_BUTTONS] = {false};
-static uint16_t buttonTransitions[NUM_AUX_BUTTONS] = {0};
+static bool buttonStates[NUM_AUX_BUTTONS] = {false}; // for the log / OTA page
 
 static uint32_t lastPollTime = 0;
 static uint32_t lastForceResync = 0;
@@ -138,24 +139,9 @@ uint8_t pca9555_read(uint8_t addr, uint8_t reg) {
   return 0xFF;
 }
 
-// Colours the button's rectangle on the main mask (VT palette index).
-static constexpr uint8_t BUTTON_PRESSED_COLOUR = 10; // lime
-static constexpr uint8_t BUTTON_RELEASED_COLOUR = 1; // white, as in the pool
-
-static void highlightButton(uint8_t bit, bool pressed) {
-  if (!(JOY_BUTTONS_ON_SCREEN & (1u << bit)) || !vtClient->get_is_connected())
-    return;
-  vtClient->send_change_fill_attributes(
-      JOY_BUTTON_FILL_BASE + bit,
-      isobus::VirtualTerminalClient::FillType::
-          FillWithSpecifiedColourInFillColourAttribute,
-      pressed ? BUTTON_PRESSED_COLOUR : BUTTON_RELEASED_COLOUR,
-      isobus::NULL_OBJECT_ID);
-}
-
 // A (re)connected VT shows the pool's initial values: fill in the firmware
-// commit and re-send any button that is held at that moment.
-static void syncMainMaskOnConnect() {
+// commit. (Button highlights are restored by aux_buttons_update().)
+static void syncCommitOnConnect() {
   static bool wasConnected = false;
   bool connected = vtClient->get_is_connected();
   if (connected && !wasConnected) {
@@ -163,10 +149,6 @@ static void syncMainMaskOnConnect() {
     snprintf(commit, sizeof(commit), "%*s", COMMIT_TEXT_LENGTH,
              GIT_COMMIT_SHORT); // right-aligned, padded to the pool length
     vtClient->send_change_string_value(STR_COMMIT, commit);
-    for (uint8_t i = 0; i < NUM_AUX_BUTTONS; i++) {
-      if (buttonStates[i])
-        highlightButton(i, true);
-    }
   }
   wasConnected = connected;
 }
@@ -186,24 +168,19 @@ static void pollInputsAndReport(bool forceResync) {
     }
   }
 
-  // 16 extender PCA9555 buttons -> momentary boolean AUX-N inputs
+  // 16 extender PCA9555 buttons -> momentary boolean AUX-N inputs (single
+  // or multi-page, see aux_buttons.cpp)
   if (pcaExtAddr != 0) {
     uint8_t port0 = ~pca9555_read(pcaExtAddr, PCA9555_REG_INPUT0);
     uint8_t port1 = ~pca9555_read(pcaExtAddr, PCA9555_REG_INPUT1);
     uint16_t raw = (uint16_t)port0 | ((uint16_t)port1 << 8);
+    aux_buttons_report(raw, forceResync);
     bool anyChanged = false;
     for (uint8_t i = 0; i < NUM_AUX_BUTTONS; i++) {
       bool pressed = (raw & (1u << i)) != 0;
-      if (forceResync || pressed != buttonStates[i]) {
-        if (pressed != buttonStates[i]) {
-          buttonStates[i] = pressed;
-          buttonTransitions[i]++;
-          anyChanged = true;
-          highlightButton(i, pressed);
-        }
-        vtClient->update_auxiliary_input(AUX_BUTTON_IDS[i],
-                                          buttonStates[i] ? 1 : 0,
-                                          buttonTransitions[i]);
+      if (pressed != buttonStates[i]) {
+        buttonStates[i] = pressed;
+        anyChanged = true;
       }
     }
     if (anyChanged) {
@@ -280,7 +257,12 @@ static void setupIsobus() {
   deviceName.set_industry_group(2);
   deviceName.set_device_class(0);
   deviceName.set_function_code(129);
-  deviceName.set_identity_number(1);
+  // A separate NAME per page mode: VTs store pools and AUX assignments by
+  // input unit NAME + input object ID (AgIsoVirtualTerminal ignores the
+  // model identification code). Sharing one NAME let a single-mode
+  // assignment (input 206) be restored onto the multi-page input set, where
+  // that input doesn't exist - and AgIsoVirtualTerminal hung.
+  deviceName.set_identity_number(settings_multi_page() ? 2 : 1);
   deviceName.set_ecu_instance(0);
   deviceName.set_function_instance(0);
   deviceName.set_device_class_instance(0);
@@ -308,16 +290,18 @@ static void setupIsobus() {
   // updates (per ISO 11783-6, a VT is allowed to skip re-uploading a pool
   // it already has cached under the same version string for this NAME) and
   // silently keep serving its old cached pool.
-  std::string poolVersion = isobus::IOPFileInterface::hash_object_pool_to_version(
-      AUX_N_POOL_DATA, AUX_N_POOL_SIZE);
-  vtClient->set_object_pool(0, AUX_N_POOL_DATA, AUX_N_POOL_SIZE, poolVersion);
-  vtClient->set_auxiliary_input_model_identification_code(1);
+  bool multiPage = settings_multi_page();
+  const uint8_t *poolData = multiPage ? AUX_N_POOL_MULTI_DATA : AUX_N_POOL_SINGLE_DATA;
+  uint32_t poolSize = multiPage ? AUX_N_POOL_MULTI_SIZE : AUX_N_POOL_SINGLE_SIZE;
+  std::string poolVersion =
+      isobus::IOPFileInterface::hash_object_pool_to_version(poolData, poolSize);
+  vtClient->set_object_pool(0, poolData, poolSize, poolVersion);
+  Serial.printf("[AUX-N] %s-page pool, %lu bytes\n", multiPage ? "multi" : "single",
+                (unsigned long)poolSize);
   for (uint8_t i = 0; i < NUM_AUX_ANALOG; i++) {
     vtClient->add_auxiliary_input_object_id(AUX_ANALOG_IDS[i]);
   }
-  for (uint8_t i = 0; i < NUM_AUX_BUTTONS; i++) {
-    vtClient->add_auxiliary_input_object_id(AUX_BUTTON_IDS[i]);
-  }
+  aux_buttons_setup(vtClient, internalECU, multiPage);
   vtClient->initialize(true);
 }
 
@@ -389,9 +373,11 @@ void setup() {
 
   detectExtenderPCA9555();
 
+  settings_load(); // the page mode picks the object pool
   setupIsobus();
   Serial.println("[AUX-N] ISOBUS stack started, claiming address...");
   lights_setup(vtClient);
+  settings_setup(vtClient);
 
 #if defined(ENABLE_OTA_WEBSERVER)
   ota_setup();
@@ -463,7 +449,9 @@ void loop() {
   recoverFromBusOff();
   vtClient->update();
   lights_update();
-  syncMainMaskOnConnect();
+  settings_update();
+  aux_buttons_update();
+  syncCommitOnConnect();
 
   uint32_t now = millis();
   if (now - lastPollTime >= POLL_INTERVAL_MS) {

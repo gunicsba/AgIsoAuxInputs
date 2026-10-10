@@ -59,7 +59,19 @@ Brain board + JH-D400X module + Handgrip keypad.
 - 4 ADS1115 channels are sent as analog AUX-N inputs (function type "analogue, maintains position"), labelled `A1`-`A4`.
 - 16 keypad PCA9555 pins are sent as momentary boolean AUX-N inputs. The bit number equals the silkscreen number next to each button; see the [Handgrip README](hardware/boards/handgrip/#buttons) for positions and labels.
 - The VT's main screen draws the handgrip's buttons and LEDs; a button turns green while pressed. The firmware's commit is shown at the bottom (a trailing `+` means it was built with uncommitted changes).
-- Addressable LEDs (WS2811/SK6805) on GPIO7 show the ISOBUS state: red while no VT is connected, green for 5 s after one connects. After that they follow the **Lights** page: the **LIGHT** soft key turns them on/off, the **LIGHTS** soft key opens the page with a mode button (Rainbow, Colour, White), R/G/B values (Colour mode) and a brightness percentage (Rainbow and White). Settings are kept across power cycles.
+- Addressable LEDs (WS2811/SK6805) on GPIO7 show the ISOBUS state: red while no VT is connected, green for 5 s after one connects. After that they follow the **Lights** page: the **LIGHT** soft key turns them on/off, the **LIGHTS** soft key opens the page with a mode button (Rainbow, Colour, White), R/G/B values (Colour mode) and a brightness percentage (Rainbow and White). Settings are kept across power cycles. Every button press briefly inverts the LEDs (black if lit, white if dark); this can be turned off on the Settings page.
+- The **SETUP** soft key opens the Settings page: page mode, page colours and the press flash.
+
+#### Single and multi-page mode
+
+Switch on the Settings page (**PAGES**), then press **RESTART**: the mode picks the object pool and AUX input set at boot.
+
+- **Single**: one AUX-N input per button, as listed above.
+- **Multi**: T1-T4 select page 1-4 (the active one is yellow on the VT, and the LEDs show that page's colour). Every other button has an input per page (`MC1`-`MC4`) plus `MC*` for all pages. A press goes to the current page's input if a function is assigned to it, otherwise to `MC*`. The small squares at the bottom of each button show which one is active: `-X--`, `XXXX` (`*`) or `----` (nothing assigned).
+
+The joystick learns what's assigned by reading the VT's assignment commands to the implement off the bus. The `*` inputs reuse the single-mode IDs, so an assignment made in single mode applies to all pages in multi mode. Each mode has its own NAME (identity number 1 / 2) and model identification code, so VTs keep separate pools and assignments.
+
+The main screen also has an AUX designator pointer per button, so the VT can draw the assigned function's icon in it. It's turned off for now (`SHOW_AUX_POINTERS` in `build_aux_pool.py`) while a hang in AgIsoVirtualTerminal's AUX-N build is investigated ([AgIsoVirtualTerminal#252](https://github.com/Open-Agriculture/AgIsoVirtualTerminal/issues/252)).
 
 The brain board's own PCA9555 and the optocoupler output are not used by this firmware yet.
 
@@ -110,3 +122,5 @@ HARDI and NOVA are trademarks of their respective owners. They are mentioned onl
 2026-09-13 - Parts shortage substitutions: brain board ideal diode controller is now an LM74700-Q1, handgrip LEDs are now SK6805D-EC2018
 
 2026-10-10 - Firmware: LED status and Lights page with soft keys, handgrip layout on the VT main screen with pressed-button highlight, AgIsoStack updated with CAN pacing and bus-off recovery
+
+2026-10-10 - Firmware: Settings page, single/multi-page AUX-N mode with per-page inputs, LED press flash and page colours, AUX designator pointers (hidden for now)

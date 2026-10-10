@@ -4,7 +4,9 @@
 #include <Arduino.h>
 #include <Preferences.h>
 
+#include "aux_buttons.h"
 #include "object_pool/object_pool_ids.h"
+#include "settings.h"
 
 // Brain board header H7 (220 Ω series). SK6805 (handgrip) and most WS2811
 // pixels take GRB order; 12 V WS2811 strips are often RGB instead.
@@ -17,6 +19,7 @@ static constexpr uint32_t VT_CONNECTED_GREEN_MS = 5000;
 static constexpr uint32_t FRAME_MS = 20;             // 50 fps
 static constexpr uint32_t RAINBOW_PERIOD_MS = 5000;  // one full hue turn
 static constexpr uint32_t SAVE_DELAY_MS = 2000;      // batch NVS writes while the operator edits
+static constexpr uint32_t PRESS_FLASH_MS = 200;
 
 enum class LightMode : uint8_t { Rainbow = 0, Colour = 1, White = 2, Count = 3 };
 
@@ -49,6 +52,7 @@ static bool vtWasConnected = false;
 static bool vtSynced = false;
 static uint32_t vtConnectedAt = 0;
 static uint32_t lastFrame = 0;
+static uint32_t flashUntil = 0;
 
 static void loadSettings() {
   LightSettings stored;
@@ -90,7 +94,7 @@ static void onKeyOrButton(const isobus::VirtualTerminalClient::VTKeyEvent &event
   case KEY_LIGHTS_PAGE:
     vt->send_change_active_mask(WORKING_SET, LIGHTS_MASK);
     break;
-  case KEY_LIGHTS_BACK:
+  case KEY_BACK: // from the Lights and Settings masks
     vt->send_change_active_mask(WORKING_SET, MAIN_MASK);
     break;
   case KEY_LIGHTS_TOGGLE:
@@ -136,6 +140,13 @@ static void render(uint32_t now) {
     strip.fill(strip.Color(STATUS_LEVEL, 0, 0));
   } else if (now - vtConnectedAt < VT_CONNECTED_GREEN_MS) {
     strip.fill(strip.Color(0, STATUS_LEVEL, 0));
+  } else if (aux_buttons_multi_page()) {
+    // The active page's colour, so the operator sees the page at a glance.
+    uint32_t rgb = settings_page_colour(aux_buttons_current_page());
+    uint8_t level = strip.gamma8(settings.brightness * 255 / 100);
+    strip.fill(strip.Color(((rgb >> 16) & 0xFF) * level / 255,
+                           ((rgb >> 8) & 0xFF) * level / 255,
+                           (rgb & 0xFF) * level / 255));
   } else if (!settings.on) {
     strip.clear();
   } else {
@@ -163,7 +174,25 @@ static void render(uint32_t now) {
       break;
     }
   }
+
+  // Press flash: invert what's showing - lit goes black, dark goes white.
+  if ((int32_t)(flashUntil - now) > 0) {
+    bool lit = false;
+    for (uint16_t i = 0; i < LIGHTS_COUNT && !lit; i++)
+      lit = strip.getPixelColor(i) != 0;
+    if (lit)
+      strip.clear();
+    else
+      strip.fill(strip.Color(255, 255, 255));
+  }
   strip.show();
+}
+
+void lights_button_pressed() {
+  if (settings_press_flash()) {
+    flashUntil = millis() + PRESS_FLASH_MS;
+    lastFrame = 0; // render now instead of at the next frame tick
+  }
 }
 
 void lights_setup(std::shared_ptr<isobus::VirtualTerminalClient> vtClient) {

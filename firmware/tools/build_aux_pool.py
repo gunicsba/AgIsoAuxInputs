@@ -2,11 +2,11 @@
 """
 Builds the minimal ISO 11783-6 AUX-N object pool (.iop) for the joystick
 firmware: one Working Set, a main Data Mask drawing the handgrip's button and
-LED layout, a "Lights" Data
-Mask (mode button, R/G/B and brightness inputs for the LEDs on GPIO7), soft
-keys to toggle the lights and switch between the two masks, and one Auxiliary
-Input Type 2 object per physical input (4 analog channels + 16
-extender buttons) - each with a short text designator (e.g. "B1", "A1") so
+LED layout (with a pointer per button that shows the assigned AUX function's
+designator), a "Lights" Data Mask (mode button, R/G/B and brightness inputs
+for the LEDs on GPIO7), a "Settings" Data Mask, soft keys to toggle the
+lights and switch between the masks, and Auxiliary Input Type 2 objects for
+the physical inputs - each with a short text designator (e.g. "MC", "A1") so
 the VT's aux-assignment screen shows something distinguishable per input
 instead of generic/blank entries.
 
@@ -20,10 +20,14 @@ Auxiliary Input designator... shall fit inside a Soft Key designator"), the
 designator child isn't restricted to picture graphics - a small OutputString
 is valid and much simpler than encoding bitmap icons.
 
+Two pools are built: "single" (one AUX input per button) and "multi" (T1-T4
+select a page; the other buttons have an input per page plus an all-pages
+"*" input). The firmware picks one at boot from its settings.
+
 Run this script (from firmware/) whenever object IDs/count/text need to change:
     python tools/build_aux_pool.py
-It (re)writes src/object_pool/aux_n_pool.iop, src/object_pool/object_pool_ids.h
-and src/object_pool/aux_n_pool_data.h.
+It (re)writes src/object_pool/aux_n_pool_{single,multi}.iop,
+src/object_pool/object_pool_ids.h and src/object_pool/aux_n_pool_data.h.
 """
 import pathlib
 import struct
@@ -48,9 +52,9 @@ KEY_FONT = 9
 # inline (no number variable), so the firmware updates them with Change
 # Numeric Value on the input object itself.
 BTN_LIGHTS_MODE = 12
-KEY_LIGHTS_TOGGLE = 14     # on both soft key masks
+KEY_LIGHTS_TOGGLE = 14     # on the main and lights soft key masks
 KEY_LIGHTS_PAGE = 15       # main mask -> lights mask
-KEY_LIGHTS_BACK = 16       # lights mask -> main mask
+KEY_BACK = 16              # lights / settings mask -> main mask
 STR_LIGHTS_MODE = 22
 STR_KEY_TOGGLE_TITLE = 24
 STR_KEY_TOGGLE_STATE = 25
@@ -90,6 +94,59 @@ STR_COMMIT = 52
 MAIN_TITLE_TEXT = b"AgIsoAuxInputs"
 REPO_URL_TEXT = b"github.com/gunicsba/AgIsoAuxInputs"
 COMMIT_PLACEHOLDER = b"--------"   # 7-char hash + "+" for uncommitted changes
+
+# Settings mask (see src/settings.cpp). Button labels are rewritten at runtime
+# and padded to the lengths below.
+SETTINGS_MASK = 60
+SETTINGS_SOFT_KEY_MASK = 61
+KEY_SETTINGS = 62
+STR_KEY_SETTINGS = 63
+BTN_PAGE_MODE = 64
+STR_PAGE_MODE = 65
+BTN_RESTART = 66
+STR_RESTART = 67
+STR_RESTART_HINT = 68
+BTN_PAGE_COLOUR_BASE = 70      # + page index 0..3
+STR_PAGE_COLOUR_BASE = 74      # + page index 0..3
+BTN_PRESS_FLASH = 78
+STR_PRESS_FLASH = 79
+STR_SETTINGS_TITLE = 80
+PAGE_MODE_TEXT = b"PAGES: SINGLE"
+RESTART_HINT_TEXT = b"                        "   # "RESTART TO APPLY" when pending
+PAGE_COLOUR_TEXT = b"PAGE 1: MAGENTA"
+PRESS_FLASH_TEXT = b"PRESS FLASH: ON "
+
+# --- Single vs multi-page mode ----------------------------------------------
+# Single: every button is one AUX-N input. Multi: T1-T4 select page 1-4
+# (they're not AUX inputs), and every other button has five inputs - one per
+# page plus a "*" input used on all pages unless the current page's own input
+# is assigned. Each mode has its own model identification code so the VT
+# keeps separate preferred assignments for the two input sets.
+MODEL_ID_SINGLE = 1
+MODEL_ID_MULTI = 2
+NUM_PAGES = 4
+PAGED_LAYERS = NUM_PAGES + 1   # layer 4 = all pages ("*")
+PAGE_SELECT_LABELS = ["T1", "T2", "T3", "T4"]   # page 1..4
+AUX_PAGED_BASE = 600           # + bit * NUM_PAGES + page ("*" = single-mode ID)
+DESIGNATOR_PAGED_BASE = 700    # + bit * NUM_PAGES + page
+# Auxiliary Control Designator Type 2 Object Pointers: one per on-screen AUX
+# button, pointer type 1 = the VT draws the designator of the function
+# assigned to the referenced input. Multi-page mode retargets them at runtime
+# (Change Attribute) to the input that's active on the current page.
+AUX_POINTER_BASE = 800         # + bit
+POINTER_TYPE_ASSIGNED_FUNCTION = 1
+# The pointers stay in the pool (the firmware retargets them) but are only
+# placed on the main mask when this is set. Off while investigating
+# AgIsoVirtualTerminal 1.5.1-mods hanging once they were shown.
+SHOW_AUX_POINTERS = False
+# Multi-page mode: 4 small squares at the bottom of each paged button show
+# which page's input is active (X---, -X--, XXXX for "*").
+PAGE_IND_RECT_BASE = 900       # + bit * 4 + page
+PAGE_IND_FILL_BASE = 1000      # + bit * 4 + page
+PAGE_IND_W = 9
+PAGE_IND_H = 6
+PAGE_IND_PITCH = 11
+JOY_THIN_LINE = 38
 
 # Initial texts. The firmware overwrites the toggle/mode labels with
 # send_change_string_value, padding every variant to these same lengths -
@@ -151,6 +208,7 @@ TYPE_FILL_ATTRIBUTES = 25
 TYPE_OUTPUT_STRING = 11
 TYPE_FONT_ATTRIBUTES = 23
 TYPE_AUXILIARY_INPUT_TYPE_2 = 32
+TYPE_AUXILIARY_CONTROL_DESIGNATOR_TYPE_2 = 33
 
 # Designator box is a fixed 60x60, matching the CCI reference pool's sizing.
 # FontSize::Size16x16 (16x16px/char) keeps the longest label ("X14"/"X15"/
@@ -420,7 +478,38 @@ def build_aux_input_type2(object_id: int, function_type: int, designator_id: int
     return data
 
 
-def main():
+def build_aux_designator_pointer(object_id: int, aux_object_id: int):
+    # ID(2) type(1) pointerType(1) auxObjectID(2) = 6 bytes, no macros
+    data = u16(object_id) + u8(TYPE_AUXILIARY_CONTROL_DESIGNATOR_TYPE_2)
+    data += u8(POINTER_TYPE_ASSIGNED_FUNCTION)
+    data += u16(aux_object_id)
+    return data
+
+
+PAGED_LABELS = [l for l in JOY_BUTTON_CENTRES if l not in PAGE_SELECT_LABELS]
+PAGED_BITS = [BUTTON_LABELS.index(l) for l in PAGED_LABELS]
+PAGE_SELECT_BITS = [BUTTON_LABELS.index(l) for l in PAGE_SELECT_LABELS]
+
+
+ALL_PAGES_LAYER = NUM_PAGES
+
+
+def paged_aux_id(bit: int, layer: int):
+    """AUX input for a paged button on page 0..3, or ALL_PAGES_LAYER ("*")."""
+    if layer == ALL_PAGES_LAYER:
+        return AUX_BUTTON_BASE + bit      # same ID as in single mode
+    return AUX_PAGED_BASE + bit * NUM_PAGES + layer
+
+
+def paged_designator_id(bit: int, page: int):
+    return DESIGNATOR_PAGED_BASE + bit * NUM_PAGES + page
+
+
+def paged_label(label: str, layer: int):
+    return label + ("*" if layer == NUM_PAGES else str(layer + 1))
+
+
+def build_pool(multi: bool):
     pool = bytearray()
     pool += build_working_set()
     main_children = [
@@ -435,6 +524,18 @@ def main():
             (JOY_BUTTON_RECT_BASE + bit, x, y),
             (JOY_BUTTON_LABEL_BASE + bit, x, y),
         ]
+        if multi and label in PAGE_SELECT_LABELS:
+            continue  # page selectors: no AUX input, no designator
+        # Drawn after the label: once a function is assigned, its designator
+        # covers the label.
+        if SHOW_AUX_POINTERS:
+            main_children.append((AUX_POINTER_BASE + bit, x, y))
+        if multi:
+            for page in range(NUM_PAGES):
+                main_children.append((
+                    PAGE_IND_RECT_BASE + bit * NUM_PAGES + page,
+                    x + 3 + page * PAGE_IND_PITCH,
+                    y + JOY_BUTTON_H - PAGE_IND_H - 3))
     for led, (cx, cy) in enumerate(JOY_LED_CENTRES):
         main_children.append((JOY_LED_RECT_BASE + led, cx - JOY_LED_SIZE // 2,
                               cy - JOY_LED_SIZE // 2))
@@ -454,10 +555,22 @@ def main():
             (input_id, 170, y),
         ]
     pool += build_data_mask(LIGHTS_MASK, LIGHTS_SOFT_KEY_MASK, lights_children)
+    pool += build_data_mask(SETTINGS_MASK, SETTINGS_SOFT_KEY_MASK, [
+        (STR_SETTINGS_TITLE, 10, 10),
+        (BTN_PAGE_MODE, 10, 50),
+        (BTN_RESTART, 250, 50),
+        (STR_RESTART_HINT, 10, 108),
+        (BTN_PAGE_COLOUR_BASE + 0, 10, 140),
+        (BTN_PAGE_COLOUR_BASE + 1, 250, 140),
+        (BTN_PAGE_COLOUR_BASE + 2, 10, 200),
+        (BTN_PAGE_COLOUR_BASE + 3, 250, 200),
+        (BTN_PRESS_FLASH, 10, 260),
+    ])
     pool += build_soft_key_mask(MAIN_SOFT_KEY_MASK,
-                                [KEY_LIGHTS_TOGGLE, KEY_LIGHTS_PAGE])
+                                [KEY_LIGHTS_TOGGLE, KEY_LIGHTS_PAGE, KEY_SETTINGS])
     pool += build_soft_key_mask(LIGHTS_SOFT_KEY_MASK,
-                                [KEY_LIGHTS_TOGGLE, KEY_LIGHTS_BACK])
+                                [KEY_LIGHTS_TOGGLE, KEY_BACK])
+    pool += build_soft_key_mask(SETTINGS_SOFT_KEY_MASK, [KEY_BACK])
     pool += build_font_attributes(TEST_FONT, LABEL_FONT_SIZE_ENUM)
     pool += build_font_attributes(DESIGNATOR_FONT, DESIGNATOR_FONT_SIZE_ENUM)
     pool += build_output_string(WS_DESIGNATOR, DESIGNATOR_BOX, DESIGNATOR_BOX,
@@ -470,11 +583,61 @@ def main():
                                      justify=JUSTIFY_CENTERED)
         pool += build_aux_input_type2(oid, FUNCTION_TYPE_ANALOGUE_MAINTAINS_POSITION, did)
 
+    # The single-mode inputs exist in both pools: in multi mode a paged
+    # button's "*" input reuses its single-mode ID, and T1-T4/spares keep
+    # theirs (never pressed). A VT or implement restoring a single-mode
+    # assignment then always finds the input - AgIsoVirtualTerminal hangs on
+    # one that doesn't exist (Open-Agriculture/AgIsoVirtualTerminal#252) - and
+    # an assignment made in single mode carries over as "all pages".
     for oid, did, label in zip(AUX_BUTTON_IDS, DESIGNATOR_BUTTON_IDS, BUTTON_LABELS):
-        pool += build_output_string(did, DESIGNATOR_BOX, DESIGNATOR_BOX,
-                                     DESIGNATOR_FONT, 1, label.encode("ascii"),
-                                     justify=JUSTIFY_CENTERED)
+        if multi and label in PAGED_LABELS:
+            label = paged_label(label, ALL_PAGES_LAYER)   # "MC*", "DL+*"
+            font = TEST_FONT   # 12x16: 4 chars = 48px fit the 60px box
+        else:
+            font = DESIGNATOR_FONT
+        pool += build_output_string(did, DESIGNATOR_BOX, DESIGNATOR_BOX, font, 1,
+                                     label.encode("ascii"), justify=JUSTIFY_CENTERED)
         pool += build_aux_input_type2(oid, FUNCTION_TYPE_BOOLEAN_MOMENTARY, did)
+    for label in JOY_BUTTON_CENTRES:
+        if multi and label in PAGE_SELECT_LABELS:
+            continue
+        bit = BUTTON_LABELS.index(label)
+        # In multi mode this starts on "*"; the firmware retargets it per page.
+        pool += build_aux_designator_pointer(AUX_POINTER_BASE + bit,
+                                             AUX_BUTTON_BASE + bit)
+
+    if multi:
+        for bit, label in zip(PAGED_BITS, PAGED_LABELS):
+            for page in range(NUM_PAGES):
+                pool += build_output_string(
+                    paged_designator_id(bit, page), DESIGNATOR_BOX, DESIGNATOR_BOX,
+                    TEST_FONT, 1, paged_label(label, page).encode("ascii"),
+                    justify=JUSTIFY_CENTERED)
+                pool += build_aux_input_type2(paged_aux_id(bit, page),
+                                              FUNCTION_TYPE_BOOLEAN_MOMENTARY,
+                                              paged_designator_id(bit, page))
+                fill_id = PAGE_IND_FILL_BASE + bit * NUM_PAGES + page
+                pool += build_fill_attributes(fill_id, COLOUR_WHITE)
+                pool += build_output_rectangle(
+                    PAGE_IND_RECT_BASE + bit * NUM_PAGES + page, JOY_THIN_LINE,
+                    PAGE_IND_W, PAGE_IND_H, fill_id)
+        pool += build_line_attributes(JOY_THIN_LINE, COLOUR_BLACK, 1)
+
+    # Settings page (identical in both pools)
+    pool += build_output_string(STR_SETTINGS_TITLE, 150, 24, TEST_FONT,
+                                 COLOUR_WHITE, b"SETTINGS")
+    for button_id, label_id, text in [
+            (BTN_PAGE_MODE, STR_PAGE_MODE, PAGE_MODE_TEXT),
+            (BTN_RESTART, STR_RESTART, b"RESTART"),
+            (BTN_PRESS_FLASH, STR_PRESS_FLASH, PRESS_FLASH_TEXT),
+            *[(BTN_PAGE_COLOUR_BASE + p, STR_PAGE_COLOUR_BASE + p, PAGE_COLOUR_TEXT)
+              for p in range(NUM_PAGES)]]:
+        pool += build_button(button_id, label_id)
+        pool += build_button_label(label_id, text)
+    pool += build_output_string(STR_RESTART_HINT, 460, 24, TEST_FONT,
+                                 COLOUR_WHITE, RESTART_HINT_TEXT)
+    pool += build_key(KEY_SETTINGS, [(STR_KEY_SETTINGS, 0, 0)])
+    pool += build_key_label(STR_KEY_SETTINGS, DESIGNATOR_BOX, KEY_FONT, b"SETUP")
 
     pool += build_output_string(STR_MAIN_TITLE, 480, 40, DESIGNATOR_FONT,
                                  COLOUR_WHITE, MAIN_TITLE_TEXT,
@@ -514,7 +677,7 @@ def main():
                             TOGGLE_STATE_TEXT)
     pool += build_key(KEY_LIGHTS_PAGE, [(STR_KEY_PAGE, 0, 0)])
     pool += build_key_label(STR_KEY_PAGE, DESIGNATOR_BOX, KEY_FONT, b"LIGHTS")
-    pool += build_key(KEY_LIGHTS_BACK, [(STR_KEY_BACK, 0, 0)])
+    pool += build_key(KEY_BACK, [(STR_KEY_BACK, 0, 0)])
     pool += build_key_label(STR_KEY_BACK, DESIGNATOR_BOX, KEY_FONT, b"BACK")
 
     # Lights page
@@ -536,10 +699,25 @@ def main():
     pool += build_input_number(INPUT_GREEN, 255, 255)
     pool += build_input_number(INPUT_BLUE, 255, 255)
     pool += build_input_number(INPUT_BRIGHTNESS, 50, 100)
+    return pool
+
+
+def c_array(name: str, pool: bytes):
+    lines = [f"static const uint32_t {name}_SIZE = {len(pool)};",
+             f"static const uint8_t {name}_DATA[] = {{"]
+    for i in range(0, len(pool), 16):
+        lines.append("    " + ", ".join(f"0x{b:02X}" for b in pool[i:i + 16]) + ",")
+    return lines + ["};", ""]
+
+
+def main():
+    pools = {"single": build_pool(multi=False), "multi": build_pool(multi=True)}
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    iop_path = OUT_DIR / "aux_n_pool.iop"
-    iop_path.write_bytes(bytes(pool))
+    for name, pool in pools.items():
+        iop_path = OUT_DIR / f"aux_n_pool_{name}.iop"
+        iop_path.write_bytes(bytes(pool))
+        print(f"Wrote {iop_path} ({len(pool)} bytes)")
 
     header_path = OUT_DIR / "object_pool_ids.h"
     lines = [
@@ -554,7 +732,7 @@ def main():
         f"#define BTN_LIGHTS_MODE {BTN_LIGHTS_MODE}",
         f"#define KEY_LIGHTS_TOGGLE {KEY_LIGHTS_TOGGLE}",
         f"#define KEY_LIGHTS_PAGE {KEY_LIGHTS_PAGE}",
-        f"#define KEY_LIGHTS_BACK {KEY_LIGHTS_BACK}",
+        f"#define KEY_BACK {KEY_BACK}",
         f"#define STR_KEY_TOGGLE_STATE {STR_KEY_TOGGLE_STATE}",
         f"#define STR_LIGHTS_MODE {STR_LIGHTS_MODE}",
         f"#define INPUT_RED {INPUT_RED}",
@@ -574,34 +752,63 @@ def main():
         "static const uint16_t AUX_BUTTON_IDS[NUM_AUX_BUTTONS] = {"
         + ", ".join(str(i) for i in AUX_BUTTON_IDS) + "};",
         "",
+        "// Settings mask",
+        f"#define SETTINGS_MASK {SETTINGS_MASK}",
+        f"#define KEY_SETTINGS {KEY_SETTINGS}",
+        f"#define BTN_PAGE_MODE {BTN_PAGE_MODE}",
+        f"#define STR_PAGE_MODE {STR_PAGE_MODE}",
+        f"#define BTN_RESTART {BTN_RESTART}",
+        f"#define STR_RESTART_HINT {STR_RESTART_HINT}",
+        f"#define BTN_PAGE_COLOUR_BASE {BTN_PAGE_COLOUR_BASE}",
+        f"#define STR_PAGE_COLOUR_BASE {STR_PAGE_COLOUR_BASE}",
+        f"#define BTN_PRESS_FLASH {BTN_PRESS_FLASH}",
+        f"#define STR_PRESS_FLASH {STR_PRESS_FLASH}",
+        f"#define PAGE_MODE_TEXT_LENGTH {len(PAGE_MODE_TEXT)}",
+        f"#define RESTART_HINT_TEXT_LENGTH {len(RESTART_HINT_TEXT)}",
+        f"#define PAGE_COLOUR_TEXT_LENGTH {len(PAGE_COLOUR_TEXT)}",
+        f"#define PRESS_FLASH_TEXT_LENGTH {len(PRESS_FLASH_TEXT)}",
+        "",
+        "// Single / multi-page mode",
+        f"#define MODEL_ID_SINGLE {MODEL_ID_SINGLE}",
+        f"#define MODEL_ID_MULTI {MODEL_ID_MULTI}",
+        f"#define AUX_POINTER_BASE {AUX_POINTER_BASE}",
+        f"#define NUM_PAGES {NUM_PAGES}",
+        f"#define PAGED_LAYERS {PAGED_LAYERS}",
+        f"#define PAGE_IND_FILL_BASE {PAGE_IND_FILL_BASE}",
+        f"#define NUM_PAGED_BUTTONS {len(PAGED_BITS)}",
+        "// PCA9555 bits of the buttons that have per-page inputs in multi mode",
+        "static const uint8_t PAGED_BUTTON_BITS[NUM_PAGED_BUTTONS] = {"
+        + ", ".join(str(b) for b in PAGED_BITS) + "};",
+        "// Multi mode AUX input per paged button: pages 1..4, then \"*\" (which",
+        "// reuses the button's single-mode ID from AUX_BUTTON_IDS)",
+        "static const uint16_t PAGED_AUX_IDS[NUM_PAGED_BUTTONS][PAGED_LAYERS] = {",
+        *["    {" + ", ".join(str(paged_aux_id(b, l)) for l in range(PAGED_LAYERS)) + "},"
+          for b in PAGED_BITS],
+        "};",
+        "// PCA9555 bits of T1..T4, which select page 1..4 in multi mode",
+        "static const uint8_t PAGE_SELECT_BITS[NUM_PAGES] = {"
+        + ", ".join(str(b) for b in PAGE_SELECT_BITS) + "};",
+        "",
     ]
     header_path.write_text("\n".join(lines), encoding="ascii")
 
-    # Embedded as a plain C byte array (not a linker-embedded binary): far
+    # Embedded as plain C byte arrays (not linker-embedded binaries): far
     # simpler and more portable across PlatformIO's various framework/build
     # backends than relying on board_build.embed_files's linker-symbol
     # mechanism, which turned out to be fragile under the mixed
     # arduino+espidf framework this firmware uses.
     data_header_path = OUT_DIR / "aux_n_pool_data.h"
-    byte_lines = []
-    for i in range(0, len(pool), 16):
-        chunk = pool[i:i + 16]
-        byte_lines.append("    " + ", ".join(f"0x{b:02X}" for b in chunk) + ",")
     data_lines = [
         "// Auto-generated by tools/build_aux_pool.py - do not edit by hand.",
         "#pragma once",
         "",
         "#include <stdint.h>",
         "",
-        f"static const uint32_t AUX_N_POOL_SIZE = {len(pool)};",
-        "static const uint8_t AUX_N_POOL_DATA[] = {",
-        *byte_lines,
-        "};",
-        "",
+        *c_array("AUX_N_POOL_SINGLE", pools["single"]),
+        *c_array("AUX_N_POOL_MULTI", pools["multi"]),
     ]
     data_header_path.write_text("\n".join(data_lines), encoding="ascii")
 
-    print(f"Wrote {iop_path} ({len(pool)} bytes)")
     print(f"Wrote {header_path}")
     print(f"Wrote {data_header_path}")
 
