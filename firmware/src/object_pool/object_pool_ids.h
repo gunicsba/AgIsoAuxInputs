@@ -3,9 +3,24 @@
 
 #define WORKING_SET 0
 #define MAIN_MASK 1
-#define TEST_STRING 2
 #define TEST_FONT 3
 #define DESIGNATOR_FONT 4
+#define LIGHTS_MASK 5
+#define BTN_LIGHTS_MODE 12
+#define KEY_LIGHTS_TOGGLE 14
+#define KEY_LIGHTS_PAGE 15
+#define KEY_LIGHTS_BACK 16
+#define STR_KEY_TOGGLE_STATE 25
+#define STR_LIGHTS_MODE 22
+#define INPUT_RED 40
+#define INPUT_GREEN 41
+#define INPUT_BLUE 42
+#define INPUT_BRIGHTNESS 43
+#define JOY_BUTTON_FILL_BASE 520
+#define STR_COMMIT 52
+#define COMMIT_TEXT_LENGTH 8
+// Bit n set = PCA9555 bit n is drawn on the main mask (has a fill object)
+#define JOY_BUTTONS_ON_SCREEN 0x3FFE
 #define NUM_AUX_ANALOG 4
 #define NUM_AUX_BUTTONS 16
 

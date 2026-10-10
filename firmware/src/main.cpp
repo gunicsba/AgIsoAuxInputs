@@ -7,9 +7,12 @@
  * assigned to implement functions through the VT's normal aux-assignment
  * screen.
  *
- * Object pool: one Working Set + one Data Mask showing "TEST" (enough to
- * confirm the pool uploaded), plus 20 Auxiliary Input Type 2 objects (4
- * analog channels from the ADS1115, 16 buttons from the extender PCA9555).
+ * Object pool: one Working Set, a main Data Mask drawing the handgrip (each
+ * button highlights while pressed; the firmware commit is shown at the
+ * bottom), a "Lights" Data Mask controlling the addressable LEDs on GPIO7
+ * (see lights.cpp) with soft keys to switch between them, plus 20 Auxiliary
+ * Input Type 2 objects (4 analog channels from the ADS1115, 16 buttons from
+ * the extender PCA9555).
  * The pool binary is built offline by tools/build_aux_pool.py, which emits
  * both a standalone .iop file (for reference/upload tools) and the embedded
  * C byte array in object_pool/aux_n_pool_data.h that this file actually
@@ -30,6 +33,8 @@
 #include "isobus/isobus/isobus_virtual_terminal_client.hpp"
 #include "isobus/utility/iop_file_interface.hpp"
 
+#include "git_version.h"
+#include "lights.h"
 #include "object_pool/aux_n_pool_data.h"
 #include "object_pool/object_pool_ids.h"
 
@@ -76,6 +81,30 @@ public:
 };
 static ArduinoCANStackLogger canStackLogger;
 
+// TWAIPlugin with a minimum gap between transmitted frames. Back-to-back
+// TP data frames during an object pool upload drove the bus to bus-off on
+// every attempt (most likely the VT's CAN adapter overrunning and answering
+// with error frames). A write refused here stays queued in the stack and is
+// retried on the next update().
+class PacedTWAIPlugin : public isobus::TWAIPlugin {
+public:
+  using isobus::TWAIPlugin::TWAIPlugin;
+
+  bool write_frame(const isobus::CANMessageFrame &canFrame) override {
+    uint32_t now = micros();
+    if (now - lastTxMicros < MIN_TX_GAP_US)
+      return false;
+    if (!isobus::TWAIPlugin::write_frame(canFrame))
+      return false;
+    lastTxMicros = now;
+    return true;
+  }
+
+private:
+  static constexpr uint32_t MIN_TX_GAP_US = 2000;
+  uint32_t lastTxMicros = 0;
+};
+
 static Adafruit_ADS1115 ads;
 static std::shared_ptr<isobus::VirtualTerminalClient> vtClient = nullptr;
 static std::shared_ptr<isobus::InternalControlFunction> internalECU = nullptr;
@@ -109,6 +138,39 @@ uint8_t pca9555_read(uint8_t addr, uint8_t reg) {
   return 0xFF;
 }
 
+// Colours the button's rectangle on the main mask (VT palette index).
+static constexpr uint8_t BUTTON_PRESSED_COLOUR = 10; // lime
+static constexpr uint8_t BUTTON_RELEASED_COLOUR = 1; // white, as in the pool
+
+static void highlightButton(uint8_t bit, bool pressed) {
+  if (!(JOY_BUTTONS_ON_SCREEN & (1u << bit)) || !vtClient->get_is_connected())
+    return;
+  vtClient->send_change_fill_attributes(
+      JOY_BUTTON_FILL_BASE + bit,
+      isobus::VirtualTerminalClient::FillType::
+          FillWithSpecifiedColourInFillColourAttribute,
+      pressed ? BUTTON_PRESSED_COLOUR : BUTTON_RELEASED_COLOUR,
+      isobus::NULL_OBJECT_ID);
+}
+
+// A (re)connected VT shows the pool's initial values: fill in the firmware
+// commit and re-send any button that is held at that moment.
+static void syncMainMaskOnConnect() {
+  static bool wasConnected = false;
+  bool connected = vtClient->get_is_connected();
+  if (connected && !wasConnected) {
+    char commit[COMMIT_TEXT_LENGTH + 1];
+    snprintf(commit, sizeof(commit), "%*s", COMMIT_TEXT_LENGTH,
+             GIT_COMMIT_SHORT); // right-aligned, padded to the pool length
+    vtClient->send_change_string_value(STR_COMMIT, commit);
+    for (uint8_t i = 0; i < NUM_AUX_BUTTONS; i++) {
+      if (buttonStates[i])
+        highlightButton(i, true);
+    }
+  }
+  wasConnected = connected;
+}
+
 static void pollInputsAndReport(bool forceResync) {
   // 4 ADS1115 channels -> analog AUX-N inputs (maintains-position pots)
   for (uint8_t ch = 0; ch < NUM_AUX_ANALOG; ch++) {
@@ -137,6 +199,7 @@ static void pollInputsAndReport(bool forceResync) {
           buttonStates[i] = pressed;
           buttonTransitions[i]++;
           anyChanged = true;
+          highlightButton(i, pressed);
         }
         vtClient->update_auxiliary_input(AUX_BUTTON_IDS[i],
                                           buttonStates[i] ? 1 : 0,
@@ -182,13 +245,23 @@ static void setupIsobus() {
   isobus::CANStackLogger::set_log_level(
       isobus::CANStackLogger::LoggingLevel::Debug);
 
-  twai_general_config_t twaiConfig = TWAI_GENERAL_CONFIG_DEFAULT(
+  // Static: TWAIPlugin keeps pointers to these configs.
+  static twai_general_config_t twaiConfig = TWAI_GENERAL_CONFIG_DEFAULT(
       (gpio_num_t)CAN_TX_PIN, (gpio_num_t)CAN_RX_PIN, TWAI_MODE_NORMAL);
-  twai_timing_config_t twaiTiming = TWAI_TIMING_CONFIG_250KBITS();
-  twai_filter_config_t twaiFilter = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+  // The default 5-frame queues overflow during an object pool upload while
+  // loop() is busy elsewhere (I2C reads, LEDs), dropping the VT's TP
+  // flow-control frames until its session times out.
+  twaiConfig.rx_queue_len = 64;
+  twaiConfig.tx_queue_len = 32;
+  static twai_timing_config_t twaiTiming = TWAI_TIMING_CONFIG_250KBITS();
+  static twai_filter_config_t twaiFilter = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+  // Zero timeouts: without threads, update() reads one frame per call, and
+  // the default 100 ms blocking receive would stall loop() whenever the bus
+  // is quiet. A failed non-blocking write stays queued in the stack and is
+  // retried on the next update().
   std::shared_ptr<isobus::CANHardwarePlugin> canDriver =
-      std::make_shared<isobus::TWAIPlugin>(&twaiConfig, &twaiTiming,
-                                            &twaiFilter);
+      std::make_shared<PacedTWAIPlugin>(&twaiConfig, &twaiTiming,
+                                         &twaiFilter, 0, 0);
 
   isobus::CANHardwareInterface::set_number_of_can_channels(1);
   isobus::CANHardwareInterface::assign_can_channel_frame_handler(0, canDriver);
@@ -289,6 +362,10 @@ void setup() {
     delay(10);
 
   Serial.println("\n=== Joystick AUX-N (ISOBUS Auxiliary Control Type 2) ===");
+  // esp_reset_reason_t: 1 power-on, 3 software, 4 panic/exception,
+  // 5-7 watchdogs, 9 brownout - tells a crash apart from a RESET press.
+  Serial.printf("Commit: %s  Reset reason: %d\n", GIT_COMMIT_SHORT,
+                (int)esp_reset_reason());
 
   pinMode(LED1_PIN, OUTPUT);
   pinMode(LED2_PIN, OUTPUT);
@@ -305,12 +382,16 @@ void setup() {
     }
   }
   ads.setGain(GAIN_ONE); // +/- 4.096V
+  // 860 SPS: each single-shot read blocks ~1.2 ms instead of ~8 ms at the
+  // default 128 SPS, so polling 4 channels no longer starves the CAN loop.
+  ads.setDataRate(RATE_ADS1115_860SPS);
   Serial.println("ADS1115 OK");
 
   detectExtenderPCA9555();
 
   setupIsobus();
   Serial.println("[AUX-N] ISOBUS stack started, claiming address...");
+  lights_setup(vtClient);
 
 #if defined(ENABLE_OTA_WEBSERVER)
   ota_setup();
@@ -346,6 +427,25 @@ static void printStatus() {
                 (unsigned long)twaiStatus.msgs_to_tx);
 }
 
+static constexpr uint8_t CAN_UPDATES_PER_LOOP = 16;
+
+// The TWAI controller stops transmitting for good after bus-off unless the
+// application recovers it (ESP-IDF doesn't, and neither does TWAIPlugin).
+static void recoverFromBusOff() {
+  twai_status_info_t status;
+  if (twai_get_status_info(&status) != ESP_OK)
+    return;
+  if (status.state == TWAI_STATE_BUS_OFF) {
+    Serial.printf("[TWAI] bus-off (bus_err=%lu), recovering\n",
+                  (unsigned long)status.bus_error_count);
+    twai_initiate_recovery();
+  } else if (status.state == TWAI_STATE_STOPPED) {
+    // Recovery finished (128 x 11 recessive bits seen): restart.
+    twai_start();
+    Serial.println("[TWAI] recovered, restarted");
+  }
+}
+
 void loop() {
   // AgIsoStack compiles out its own background worker threads when ARDUINO
   // is defined (see CANHardwareInterface::update_thread_function() and
@@ -355,8 +455,15 @@ void loop() {
   // possible: CANHardwareInterface for RX/TX pumping and the network
   // manager (address claiming, ...), VirtualTerminalClient for its own
   // state machine (VT handshake, object pool upload, ...).
-  isobus::CANHardwareInterface::update();
+  // Each update() moves at most one received frame, so pump several times
+  // to keep up with bursts (e.g. TP flow control during the pool upload).
+  for (uint8_t i = 0; i < CAN_UPDATES_PER_LOOP; i++) {
+    isobus::CANHardwareInterface::update();
+  }
+  recoverFromBusOff();
   vtClient->update();
+  lights_update();
+  syncMainMaskOnConnect();
 
   uint32_t now = millis();
   if (now - lastPollTime >= POLL_INTERVAL_MS) {

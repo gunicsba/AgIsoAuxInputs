@@ -11,3 +11,7 @@ firmware/dependencies.lock
 .vscode/ipch
 firmware/.vscode/
 dist/
+
+# Generated at build time by firmware/tools/git_version.py
+firmware/src/git_version.h
+__pycache__/
