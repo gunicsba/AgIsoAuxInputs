@@ -35,6 +35,7 @@
 
 #include "git_version.h"
 #include "aux_buttons.h"
+#include "debug_log.h"
 #include "lights.h"
 #include "object_pool/aux_n_pool_data.h"
 #include "object_pool/aux_n_pool_justify.h"
@@ -80,8 +81,12 @@ class ArduinoCANStackLogger : public isobus::CANStackLogger {
 public:
   void sink_CAN_stack_log(CANStackLogger::LoggingLevel level,
                            const std::string &text) override {
-    (void)level;
-    Serial.println(text.c_str());
+    // Debug level is chatty (every TP session...): serial only, so the
+    // /debug log keeps the VT handshake, warnings and errors.
+    if (level >= LoggingLevel::Info)
+      debug_log("%s", text.c_str());
+    else
+      Serial.println(text.c_str());
   }
 };
 static ArduinoCANStackLogger canStackLogger;
@@ -366,6 +371,7 @@ static void handleOtaRoot() {
   String html = "<html><body style='font-family:sans-serif'>"
                 "<h3>Joystick AUX-N</h3><p>ISOBUS AUX-N joystick firmware.</p>"
                 "<p><a href='/wifi'>Wi-Fi setup</a> | "
+                "<a href='/debug'>Debug</a> | "
                 "<a href='/update'>Firmware update</a></p>"
                 "<p>Analog: ";
   for (uint8_t i = 0; i < NUM_AUX_ANALOG; i++) {
@@ -379,6 +385,49 @@ static void handleOtaRoot() {
   otaServer.send(200, "text/html", html);
 }
 
+static const char *vtVersionName(isobus::VirtualTerminalClient::VTVersion version) {
+  switch (version) {
+    case isobus::VirtualTerminalClient::VTVersion::Version2OrOlder: return "2 or older";
+    case isobus::VirtualTerminalClient::VTVersion::Version3: return "3";
+    case isobus::VirtualTerminalClient::VTVersion::Version4: return "4";
+    case isobus::VirtualTerminalClient::VTVersion::Version5: return "5";
+    case isobus::VirtualTerminalClient::VTVersion::Version6: return "6";
+    default: return "unknown";
+  }
+}
+
+// Plain text, so it reads the same in a browser and from curl.
+static void handleDebug() {
+  const uint32_t now = millis();
+  String out;
+  out.reserve(12000);
+  out += "Joystick AUX-N " + String(GIT_COMMIT_SHORT) + ", up " + String(now / 1000) +
+         " s, reset reason " + String((int)esp_reset_reason()) + "\n";
+  out += "heap free " + String(ESP.getFreeHeap()) + ", min " + String(ESP.getMinFreeHeap()) +
+         "\n\nISOBUS\n  address ";
+  out += internalECU->get_address_valid() ? String(internalECU->get_address()) : "not claimed";
+  out += ", VT " + String(vtClient->get_is_connected() ? "connected" : "not connected") +
+         " (version " + vtVersionName(vtClient->get_connected_vt_version()) + "), " +
+         (settings_multi_page() ? "multi" : "single") + "-page pool\n";
+  twai_status_info_t twai;
+  if (twai_get_status_info(&twai) == ESP_OK) {
+    static const char *stateNames[] = {"STOPPED", "RUNNING", "BUS_OFF", "RECOVERING"};
+    out += "  TWAI " + String(twai.state < 4 ? stateNames[twai.state] : "?") + ", tx_err " +
+           String(twai.tx_error_counter) + ", rx_err " + String(twai.rx_error_counter) +
+           ", bus_err " + String(twai.bus_error_count) + ", msgs_to_tx " +
+           String(twai.msgs_to_tx) + "\n";
+  }
+  out += "\n";
+  wifi_debug_status(out);
+#if defined(ENABLE_VIEWT_BRIDGE)
+  out += "\n";
+  viewt_bridge::debug_status(out);
+#endif
+  out += "\nLog (newest last)\n";
+  debug_log_dump(out);
+  otaServer.send(200, "text/plain; charset=utf-8", out);
+}
+
 static void ota_setup() {
 #if defined(ENABLE_VIEWT_BRIDGE)
   wifi_setup(otaServer, viewt_bridge::wifi_settings());
@@ -388,9 +437,10 @@ static void ota_setup() {
 #endif
 
   otaServer.on("/", HTTP_GET, handleOtaRoot);
+  otaServer.on("/debug", HTTP_GET, handleDebug);
   otaServer.begin();
   ESP2SOTA.begin(&otaServer);
-  Serial.println("[OTA] Web server started on port 80 (/update for firmware)");
+  debug_log("[OTA] Web server started on port 80 (/debug, /update)");
 }
 
 static void ota_loop() {
@@ -408,8 +458,7 @@ void setup() {
   Serial.println("\n=== Joystick AUX-N (ISOBUS Auxiliary Control Type 2) ===");
   // esp_reset_reason_t: 1 power-on, 3 software, 4 panic/exception,
   // 5-7 watchdogs, 9 brownout - tells a crash apart from a RESET press.
-  Serial.printf("Commit: %s  Reset reason: %d\n", GIT_COMMIT_SHORT,
-                (int)esp_reset_reason());
+  debug_log("Commit: %s  Reset reason: %d", GIT_COMMIT_SHORT, (int)esp_reset_reason());
 
   pinMode(LED1_PIN, OUTPUT);
   pinMode(LED2_PIN, OUTPUT);

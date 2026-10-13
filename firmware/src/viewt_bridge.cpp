@@ -17,9 +17,12 @@
 #include <cstring>
 #include <errno.h>
 #include <lwip/sockets.h>
+#include <lwip/tcp.h>
 
 #include "driver/twai.h"
 #include "esp_mac.h"
+
+#include "debug_log.h"
 
 namespace viewt_bridge {
 
@@ -62,7 +65,14 @@ static constexpr size_t OD_VALUE_CAPACITY = 64;
 static constexpr UBaseType_t TCP_QUEUE_LENGTH = 512;
 static constexpr UBaseType_t STACK_RX_QUEUE_LENGTH = 256;
 static constexpr size_t TCP_CAN_BATCH_CAPACITY = 1360;
-static constexpr uint32_t TCP_WRITE_TIMEOUT_MS = 500;
+// Long enough to ride out a Wi-Fi retry burst or a phone's power-save
+// interval; the CAN-to-TCP queue holds several seconds of traffic meanwhile.
+static constexpr uint32_t TCP_WRITE_TIMEOUT_MS = 2000;
+// Dead peer (e.g. phone left the AP without closing) detected after
+// idle + interval * count seconds.
+static constexpr int TCP_KEEPALIVE_IDLE_S = 5;
+static constexpr int TCP_KEEPALIVE_INTERVAL_S = 2;
+static constexpr int TCP_KEEPALIVE_COUNT = 3;
 // Tablet frames are sent from the TCP task, which can afford to wait briefly
 // for room in the TWAI TX queue.
 static constexpr TickType_t TABLET_TO_BUS_TIMEOUT = pdMS_TO_TICKS(20);
@@ -101,6 +111,15 @@ static volatile uint32_t tcpQueueDropCount = 0;
 static volatile uint32_t stackQueueDropCount = 0;
 static volatile uint32_t busTxFailCount = 0;
 static uint32_t tcpWriteFailureCount = 0;
+
+// Session bookkeeping for /debug (tcpTask only)
+static String tabletAddress;
+static uint32_t sessionStartMs = 0;
+static uint32_t sessionStartTxFrames = 0;
+static uint32_t sessionStartRxFrames = 0;
+static uint32_t sessionCount = 0;
+static String lastCloseReason;
+static uint32_t lastCloseMs = 0;
 
 // ---------------------------------------------------------------------------
 // Protocol encoding
@@ -187,7 +206,7 @@ void BridgedTWAIPlugin::open() {
   if (stackRxQueue == nullptr)
     stackRxQueue = xQueueCreate(STACK_RX_QUEUE_LENGTH, sizeof(isobus::CANMessageFrame));
   if (tcpQueue == nullptr || stackRxQueue == nullptr) {
-    Serial.println("[BRIDGE] FATAL: queue allocation failed");
+    debug_log("[BRIDGE] FATAL: queue allocation failed");
     return;
   }
   if (!rxTaskStarted &&
@@ -228,12 +247,17 @@ bool has_pending_stack_frames() {
 // ---------------------------------------------------------------------------
 // TCP side (only ever touched by tcpTask)
 
-static void closeTcpClient(const char *reason) {
+static void closeTcpClient(const String &reason) {
   if (activeTcpGeneration == 0 && !tcpClient) return;
   activeTcpGeneration = 0;
   tcpClient.stop();
   tcpBufferLength = 0;
-  Serial.printf("[BRIDGE] Tablet disconnected: %s\n", reason);
+  lastCloseReason = reason;
+  lastCloseMs = millis();
+  debug_log("[BRIDGE] Tablet %s disconnected after %lu s (%lu frames out, %lu in): %s",
+            tabletAddress.c_str(), (unsigned long)((lastCloseMs - sessionStartMs) / 1000),
+            (unsigned long)(tcpTxFrameCount - sessionStartTxFrames),
+            (unsigned long)(tabletRxCount - sessionStartRxFrames), reason.c_str());
 }
 
 static bool sendToTcp(const uint8_t *data, size_t length) {
@@ -242,20 +266,35 @@ static bool sendToTcp(const uint8_t *data, size_t length) {
   const int socketFd = tcpClient.fd();
   const uint32_t startedAt = millis();
   size_t sent = 0;
+  int error = 0;
   while (sent < length && tcpClient.connected()) {
     const int result = lwip_send(socketFd, data + sent, length - sent, MSG_DONTWAIT);
     if (result > 0) {
       sent += (size_t)result;
       continue;
     }
-    if (result < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) break;
+    if (result < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+      error = errno;
+      break;
+    }
     if ((uint32_t)(millis() - startedAt) >= TCP_WRITE_TIMEOUT_MS) break;
     vTaskDelay(1);
   }
 
   if (sent == length) return true;
   ++tcpWriteFailureCount;
-  closeTcpClient("write failed or timed out");
+  char reason[96];
+  if (error != 0) {
+    snprintf(reason, sizeof(reason), "write error %d (%s), %u/%u bytes sent", error,
+             strerror(error), (unsigned)sent, (unsigned)length);
+  } else if (!tcpClient.connected()) {
+    snprintf(reason, sizeof(reason), "connection lost while writing, %u/%u bytes sent",
+             (unsigned)sent, (unsigned)length);
+  } else {
+    snprintf(reason, sizeof(reason), "write stalled for %lu ms, %u/%u bytes sent",
+             (unsigned long)TCP_WRITE_TIMEOUT_MS, (unsigned)sent, (unsigned)length);
+  }
+  closeTcpClient(reason);
   return false;
 }
 
@@ -343,12 +382,12 @@ static void handleObjectDictionaryRead(uint16_t index, uint8_t subIndex) {
     data = &wifiChannel;
     length = 1;
   } else {
-    Serial.printf("[BRIDGE] OD read unsupported: %04X:%02X\n", index, subIndex);
+    debug_log("[BRIDGE] OD read unsupported: %04X:%02X", index, subIndex);
   }
 
   const uint8_t header[] = {OD_READ_RESPONSE, (uint8_t)index, (uint8_t)(index >> 8), subIndex};
   sendFrame(OBJECT_DICTIONARY_TYPE, header, sizeof(header), data, length);
-  Serial.printf("[BRIDGE] OD read: %04X:%02X (%u bytes)\n", index, subIndex, (unsigned)length);
+  debug_log("[BRIDGE] OD read: %04X:%02X (%u bytes)", index, subIndex, (unsigned)length);
 }
 
 static void handleObjectDictionaryWrite(uint16_t index, uint8_t subIndex,
@@ -364,10 +403,10 @@ static void handleObjectDictionaryWrite(uint16_t index, uint8_t subIndex,
     wifiChannel = data[0];
     preferences.putUChar("wifiChannel", wifiChannel);
   } else {
-    Serial.printf("[BRIDGE] OD write unsupported: %04X:%02X\n", index, subIndex);
+    debug_log("[BRIDGE] OD write unsupported: %04X:%02X", index, subIndex);
     return;
   }
-  Serial.printf("[BRIDGE] OD write: %04X:%02X (%u bytes)\n", index, subIndex, (unsigned)length);
+  debug_log("[BRIDGE] OD write: %04X:%02X (%u bytes)", index, subIndex, (unsigned)length);
 }
 
 static void handleObjectDictionaryFrame(const uint8_t *frame, uint8_t bodyLength) {
@@ -384,7 +423,7 @@ static void handleObjectDictionaryFrame(const uint8_t *frame, uint8_t bodyLength
   } else if (command == OD_WRITE) {
     handleObjectDictionaryWrite(index, subIndex, data, dataLength);
   } else {
-    Serial.printf("[BRIDGE] Unknown OD command: %02X\n", command);
+    debug_log("[BRIDGE] Unknown OD command: %02X", command);
   }
 }
 
@@ -398,7 +437,7 @@ static void handleCanControllerCommand(uint8_t command, const uint8_t *data,
       sendFrame(command, nullptr, 0, &baud, 1);
     } else {
       sendFrame(COMMAND_DEVICE_BUSY, nullptr, 0, nullptr, 0);
-      Serial.printf("[BRIDGE] Refused CAN baud rate code %02X (ISOBUS is fixed at 250k)\n", data[0]);
+      debug_log("[BRIDGE] Refused CAN baud rate code %02X (ISOBUS is fixed at 250k)", data[0]);
     }
   }
 }
@@ -468,21 +507,39 @@ static void handleTcpInput() {
   if (!tcpClient.connected()) closeTcpClient("peer disconnected");
 }
 
+static void enableKeepalive(int socketFd) {
+  const int on = 1;
+  setsockopt(socketFd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
+  setsockopt(socketFd, IPPROTO_TCP, TCP_KEEPIDLE, &TCP_KEEPALIVE_IDLE_S, sizeof(int));
+  setsockopt(socketFd, IPPROTO_TCP, TCP_KEEPINTVL, &TCP_KEEPALIVE_INTERVAL_S, sizeof(int));
+  setsockopt(socketFd, IPPROTO_TCP, TCP_KEEPCNT, &TCP_KEEPALIVE_COUNT, sizeof(int));
+}
+
 static void acceptTcpClient() {
-  if (activeTcpGeneration != 0 && tcpClient.connected()) return;
-  if (activeTcpGeneration != 0) closeTcpClient("peer disconnected");
+  if (activeTcpGeneration != 0 && !tcpClient.connected()) closeTcpClient("peer disconnected");
   WiFiClient candidate = tcpServer.available();
   if (!candidate) return;
+  // A new connection replaces the current one: after a Wi-Fi drop the app
+  // reconnects while our old socket may still look alive, and it would
+  // otherwise sit unserved until that socket times out.
+  if (activeTcpGeneration != 0)
+    closeTcpClient("replaced by new connection from " + candidate.remoteIP().toString());
   if (tcpClient) tcpClient.stop();
   tcpClient = candidate;
   tcpClient.setNoDelay(true);
+  enableKeepalive(tcpClient.fd());
   tcpBufferLength = 0;
   xQueueReset(tcpQueue);
   uint32_t generation = nextTcpGeneration++;
   if (generation == 0) generation = nextTcpGeneration++;
   tcpQueueFaultGeneration = 0;
+  tabletAddress = tcpClient.remoteIP().toString() + ":" + String(tcpClient.remotePort());
+  sessionStartMs = millis();
+  sessionStartTxFrames = tcpTxFrameCount;
+  sessionStartRxFrames = tabletRxCount;
+  ++sessionCount;
   activeTcpGeneration = generation;
-  Serial.printf("[BRIDGE] Tablet connected: %s\n", tcpClient.remoteIP().toString().c_str());
+  debug_log("[BRIDGE] Tablet connected: %s", tabletAddress.c_str());
 }
 
 static void tcpTask(void *) {
@@ -504,7 +561,7 @@ WifiSettings wifi_settings() {
 
 void begin() {
   if (tcpQueue == nullptr || stackRxQueue == nullptr) {
-    Serial.println("[BRIDGE] CAN plugin not opened; bridge disabled");
+    debug_log("[BRIDGE] CAN plugin not opened; bridge disabled");
     return;
   }
 
@@ -517,13 +574,35 @@ void begin() {
   tcpServer.setNoDelay(true);
 
   if (xTaskCreatePinnedToCore(tcpTask, "viewt-tcp", 6144, nullptr, 2, nullptr, 0) != pdPASS) {
-    Serial.println("[BRIDGE] TCP task creation failed; bridge disabled");
+    debug_log("[BRIDGE] TCP task creation failed; bridge disabled");
     return;
   }
   MDNS.addService("viewt", "tcp", TCP_PORT);
   MDNS.addServiceTxt("viewt", "tcp", "id", String(deviceId));
-  Serial.printf("[BRIDGE] TCP port %u (%s or %s.local), device ID %s\n", TCP_PORT,
-                AP_IP.toString().c_str(), HOSTNAME, deviceId);
+  debug_log("[BRIDGE] TCP port %u (%s or %s.local), device ID %s", TCP_PORT,
+            AP_IP.toString().c_str(), HOSTNAME, deviceId);
+}
+
+void debug_status(String &out) {
+  const uint32_t now = millis();
+  out += "View-T bridge (port " + String(TCP_PORT) + ", device ID " + String(deviceId) + ")\n";
+  if (activeTcpGeneration != 0) {
+    out += "  tablet " + tabletAddress + ", connected " +
+           String((now - sessionStartMs) / 1000) + " s, " +
+           String(tcpTxFrameCount - sessionStartTxFrames) + " frames out, " +
+           String(tabletRxCount - sessionStartRxFrames) + " in\n";
+  } else {
+    out += "  no tablet connected\n";
+  }
+  out += "  sessions " + String(sessionCount);
+  if (lastCloseMs != 0)
+    out += ", last closed " + String((now - lastCloseMs) / 1000) + " s ago: " + lastCloseReason;
+  out += "\n  frames: bus rx " + String(busRxCount) + ", tablet rx " + String(tabletRxCount) +
+         ", tcp tx " + String(tcpTxFrameCount) + ", queued " +
+         String(tcpQueue ? uxQueueMessagesWaiting(tcpQueue) : 0) + "\n";
+  out += "  drops: tcp queue " + String(tcpQueueDropCount) + ", stack queue " +
+         String(stackQueueDropCount) + ", bus tx " + String(busTxFailCount) +
+         ", tcp write " + String(tcpWriteFailureCount) + "\n";
 }
 
 void print_status() {

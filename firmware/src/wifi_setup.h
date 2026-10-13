@@ -31,7 +31,11 @@ struct WifiSettings {
 // _http._tcp service for the web page) and adds the /wifi pages to server.
 void wifi_setup(WebServer &server, const WifiSettings &settings);
 
-// Logs station connect/disconnect.
+// Retries the configured network (with backoff) and applies a changed AP
+// password.
 void wifi_update();
+
+// AP / station summary for the /debug page.
+void wifi_debug_status(String &out);
 
 #endif

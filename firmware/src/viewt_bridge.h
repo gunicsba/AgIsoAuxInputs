@@ -55,6 +55,9 @@ bool has_pending_stack_frames();
 
 void print_status();
 
+// Session and counter summary for the /debug page.
+void debug_status(String &out);
+
 } // namespace viewt_bridge
 
 #endif
