@@ -85,7 +85,11 @@ pio run -e joystick -t upload
 pio device monitor
 ```
 
-`joystick_ota` builds the same firmware with a Wi-Fi access point for updates: SSID `joystick-auxn`, password `12345678`. Open `http://192.168.4.1/` for live input values and `/update` to upload a new firmware.
+`joystick_ota` builds the same firmware with a Wi-Fi access point for updates: SSID `joystick-auxn`, password `12345678`. Open `http://192.168.4.1/` for live input values and `/update` to upload a new firmware. On `/wifi` you can change the access point password and join an existing network; the board is then also reachable as `http://joystick-auxn.local/`. The access point stays on either way.
+
+`joystick_viewt` is `joystick_ota` plus a Wi-Fi/CAN bridge for the View-T Android app: SSID `View-T ` (with a trailing space), password `12345678`, TCP `192.168.0.34:30000`. The app becomes the VT, so you can test the pool and aux assignment from a phone with nothing else on the CAN bus. Real bus traffic is bridged too. The web pages move to `http://192.168.0.34/`. On a joined network the bridge is `viewt.local:30000`, and it is announced as the mDNS service `_viewt._tcp`. The View-T access point needs `192.168.0.34/24`, so don't join a network that also uses `192.168.0.x`.
+
+None of these pages, nor the bridge, ask for a login: anyone on the same network can flash firmware or send CAN frames.
 
 ### Changing the object pool
 

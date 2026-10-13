@@ -40,6 +40,8 @@
 #include "object_pool/aux_n_pool_justify.h"
 #include "settings.h"
 #include "object_pool/object_pool_ids.h"
+#include "viewt_bridge.h"
+#include "wifi_setup.h"
 
 #if defined(ENABLE_OTA_WEBSERVER)
 #include <ESP2SOTA.h>
@@ -84,20 +86,26 @@ public:
 };
 static ArduinoCANStackLogger canStackLogger;
 
+#if defined(ENABLE_VIEWT_BRIDGE)
+using BaseTWAIPlugin = viewt_bridge::BridgedTWAIPlugin;
+#else
+using BaseTWAIPlugin = isobus::TWAIPlugin;
+#endif
+
 // TWAIPlugin with a minimum gap between transmitted frames. Back-to-back
 // TP data frames during an object pool upload drove the bus to bus-off on
 // every attempt (most likely the VT's CAN adapter overrunning and answering
 // with error frames). A write refused here stays queued in the stack and is
 // retried on the next update().
-class PacedTWAIPlugin : public isobus::TWAIPlugin {
+class PacedTWAIPlugin : public BaseTWAIPlugin {
 public:
-  using isobus::TWAIPlugin::TWAIPlugin;
+  using BaseTWAIPlugin::BaseTWAIPlugin;
 
   bool write_frame(const isobus::CANMessageFrame &canFrame) override {
     uint32_t now = micros();
     if (now - lastTxMicros < MIN_TX_GAP_US)
       return false;
-    if (!isobus::TWAIPlugin::write_frame(canFrame))
+    if (!BaseTWAIPlugin::write_frame(canFrame))
       return false;
     lastTxMicros = now;
     return true;
@@ -357,7 +365,8 @@ static WebServer otaServer(80);
 static void handleOtaRoot() {
   String html = "<html><body style='font-family:sans-serif'>"
                 "<h3>Joystick AUX-N</h3><p>ISOBUS AUX-N joystick firmware.</p>"
-                "<p><a href='/update'>Firmware update</a></p>"
+                "<p><a href='/wifi'>Wi-Fi setup</a> | "
+                "<a href='/update'>Firmware update</a></p>"
                 "<p>Analog: ";
   for (uint8_t i = 0; i < NUM_AUX_ANALOG; i++) {
     html += String(analogValues[i]) + " ";
@@ -371,10 +380,12 @@ static void handleOtaRoot() {
 }
 
 static void ota_setup() {
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP("joystick-auxn", "12345678");
-  IPAddress ip = WiFi.softAPIP();
-  Serial.printf("[OTA] AP started, IP: %s\n", ip.toString().c_str());
+#if defined(ENABLE_VIEWT_BRIDGE)
+  wifi_setup(otaServer, viewt_bridge::wifi_settings());
+#else
+  wifi_setup(otaServer, {"joystick-auxn", "joystick-auxn", "12345678",
+                         IPAddress(192, 168, 4, 1), 1});
+#endif
 
   otaServer.on("/", HTTP_GET, handleOtaRoot);
   otaServer.begin();
@@ -382,7 +393,10 @@ static void ota_setup() {
   Serial.println("[OTA] Web server started on port 80 (/update for firmware)");
 }
 
-static void ota_loop() { otaServer.handleClient(); }
+static void ota_loop() {
+  otaServer.handleClient();
+  wifi_update();
+}
 #endif
 
 void setup() {
@@ -426,7 +440,10 @@ void setup() {
   settings_setup(vtClient);
 
 #if defined(ENABLE_OTA_WEBSERVER)
-  ota_setup();
+  ota_setup(); // Wi-Fi + mDNS, which the bridge needs
+#endif
+#if defined(ENABLE_VIEWT_BRIDGE)
+  viewt_bridge::begin();
 #endif
 
   digitalWrite(LED1_PIN, LOW); // ready
@@ -457,6 +474,9 @@ static void printStatus() {
                 (unsigned long)twaiStatus.arb_lost_count,
                 (unsigned long)twaiStatus.bus_error_count,
                 (unsigned long)twaiStatus.msgs_to_tx);
+#if defined(ENABLE_VIEWT_BRIDGE)
+  viewt_bridge::print_status();
+#endif
 }
 
 static constexpr uint8_t CAN_UPDATES_PER_LOOP = 16;
