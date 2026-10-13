@@ -2,7 +2,7 @@
 
 A 13-button keypad for a handheld implement control grip. It has its own PCA9555 and connects to the [brain board](../brain/) over I2C.
 
-The schematic and EasyEDA project call this board **Joystick Front**.
+The schematic and EasyEDA project call this board **Joystick Front**. The design source is on OSHWLab, in the same project as the brain board: [ESP32S3R8N8 CAN Board](https://oshwlab.com/gunicsba/esp32s3r8n8-can-board).
 
 <img src="handgrip.jpg" alt="Assembled Handgrip keypad PCB with numbered buttons" width="480">
 
@@ -55,3 +55,9 @@ The number printed next to each button on the silkscreen is its PCA9555 bit (sil
 | `schematic.pdf` | Pages 1-2 are this board (in the repo: `hardware/schematic.pdf`) |
 
 The matching housing is in [enclosures/handgrip](../../enclosures/handgrip/).
+
+## Changes
+
+2026-09-13 - Added FASTLED compatible LEDs
+
+2026-09-13 - Parts shortage: replaced the SK6805-EC15 LEDs (LED1-LED6) with SK6805D-EC2018 (LCSC C5440835), which has a larger 2.0 x 1.8 mm footprint
