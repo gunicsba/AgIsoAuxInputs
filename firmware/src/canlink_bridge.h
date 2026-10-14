@@ -3,8 +3,8 @@
  * TCP port 30000, like a CANlink WiFi gateway.
  *
  * Any CANlink client (e.g. AgIsoVirtualTerminal with AgIsoStack's CANlink
- * plugin, or the View-T Android app) can join the bus through it and act as
- * the VT for this AUX-N device without other CAN hardware.
+ * plugin) can join the bus through it and act as the VT for this AUX-N
+ * device without other CAN hardware.
  *
  * The ESP32-S3 has a single TWAI controller and AgIsoStack's TWAIPlugin
  * normally owns twai_receive(), so a second reader would steal frames from
@@ -42,8 +42,8 @@ public:
   bool write_frame(const isobus::CANMessageFrame &canFrame) override;
 };
 
-// SoftAP at 192.168.0.34 (named for the View-T app, which looks for it); on a
-// configured network the board is joystick-auxn.local.
+// SoftAP "AgIsoCanLink" at 192.168.0.34; on a configured network the board
+// is joystick-auxn.local.
 WifiSettings wifi_settings();
 
 // Starts the TCP server task and announces it over mDNS (_canlink._tcp, port

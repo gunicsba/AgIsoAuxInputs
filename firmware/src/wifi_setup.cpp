@@ -25,6 +25,7 @@ static WifiSettings settings;
 static Preferences prefs;
 static String staSsid;
 static String staPassword;
+static String apSsid;
 static String apPassword;
 static uint32_t apRestartAt = 0; // 0 = none pending
 static uint32_t lastStaAttempt = 0;
@@ -84,9 +85,9 @@ static void startAccessPoint() {
   const uint8_t channel = WiFi.isConnected() ? WiFi.channel() : settings.apChannel;
   if (!WiFi.softAPConfig(settings.apIp, settings.apIp, AP_NETMASK))
     debug_log("[WIFI] softAPConfig failed");
-  if (!WiFi.softAP(settings.apSsid, apPassword.c_str(), channel, false, 4))
+  if (!WiFi.softAP(apSsid.c_str(), apPassword.c_str(), channel, false, 4))
     debug_log("[WIFI] SoftAP setup failed");
-  debug_log("[WIFI] AP '%s' ch %u at %s", settings.apSsid, channel,
+  debug_log("[WIFI] AP '%s' ch %u at %s", apSsid.c_str(), channel,
             settings.apIp.toString().c_str());
 }
 
@@ -155,12 +156,15 @@ static void handleWifiPage() {
   html += "</head><body style='font-family:sans-serif'><h3>Wi-Fi</h3>";
 
   html += "<h4>Access point (always on)</h4>"
-          "<p>SSID: <b>" + htmlEscape(settings.apSsid) + "</b> at " + settings.apIp.toString() +
+          "<p>SSID: <b>" + htmlEscape(apSsid) + "</b> at " + settings.apIp.toString() +
           "<br>Password: <b>" + htmlEscape(apPassword) + "</b></p>"
           "<form method='post' action='/wifi/ap'>"
+          "<p>SSID (1-32 characters)<br>"
+          "<input name='ssid' maxlength='32' value='" + htmlEscape(apSsid) + "'></p>"
           "<p>New password (8-63 characters)<br>"
-          "<input name='password' minlength='8' maxlength='63'></p>"
-          "<p><button>Change password</button> (reconnect with the new one)</p></form>";
+          "<input name='password' minlength='8' maxlength='63' "
+          "placeholder='unchanged if empty'></p>"
+          "<p><button>Save access point</button> (reconnect with the new settings)</p></form>";
 
   html += "<h4>Network</h4><p>" + stationStatus() + "</p>";
   html += "<p>Name: <b>" + String(settings.hostname) + ".local</b></p>";
@@ -232,15 +236,26 @@ static void handleWifiSave() {
   redirectToWifiPage();
 }
 
-static void handleApPassword() {
+static void handleApSettings() {
+  // Not trimmed: spaces are valid SSID characters.
+  const String ssid = server->arg("ssid");
   const String password = server->arg("password");
-  if (password.length() >= 8 && password.length() <= 63) { // WPA2-PSK limits
+  bool changed = false;
+  if (ssid.length() >= 1 && ssid.length() <= 32 && ssid != apSsid) { // 802.11 limit
+    apSsid = ssid;
+    prefs.putString("ap_ssid", apSsid);
+    changed = true;
+  }
+  if (password.length() >= 8 && password.length() <= 63 && password != apPassword) { // WPA2-PSK
     apPassword = password;
     prefs.putString("ap_password", apPassword);
+    changed = true;
+  }
+  if (changed) {
     apRestartAt = millis() + AP_RESTART_DELAY_MS;
     if (apRestartAt == 0)
       apRestartAt = 1;
-    debug_log("[WIFI] AP password changed");
+    debug_log("[WIFI] AP settings changed: SSID '%s'", apSsid.c_str());
   }
   redirectToWifiPage();
 }
@@ -262,6 +277,7 @@ void wifi_setup(WebServer &webServer, const WifiSettings &wifiSettings) {
   prefs.begin("wifi", false);
   staSsid = prefs.getString("ssid", "");
   staPassword = prefs.getString("password", "");
+  apSsid = prefs.getString("ap_ssid", settings.apSsid);
   apPassword = prefs.getString("ap_password", settings.apPassword);
 
   WiFi.onEvent(onWifiEvent);
@@ -283,7 +299,7 @@ void wifi_setup(WebServer &webServer, const WifiSettings &wifiSettings) {
   server->on("/wifi/scan", HTTP_POST, handleWifiScan);
   server->on("/wifi/save", HTTP_POST, handleWifiSave);
   server->on("/wifi/forget", HTTP_POST, handleWifiForget);
-  server->on("/wifi/ap", HTTP_POST, handleApPassword);
+  server->on("/wifi/ap", HTTP_POST, handleApSettings);
 }
 
 void wifi_update() {
@@ -304,7 +320,7 @@ void wifi_update() {
 void wifi_debug_status(String &out) {
   const uint32_t now = millis();
   out += "Wi-Fi\n";
-  out += "  AP '" + String(settings.apSsid) + "' " + settings.apIp.toString() + " ch " +
+  out += "  AP '" + apSsid + "' " + settings.apIp.toString() + " ch " +
          String(WiFi.channel()) + ", " + String(WiFi.softAPgetStationNum()) +
          " client(s), joins " + String(apJoinCount) + " leaves " + String(apLeaveCount) + "\n";
   out += "  station: ";

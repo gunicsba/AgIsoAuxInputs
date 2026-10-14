@@ -27,9 +27,8 @@
 
 namespace canlink_bridge {
 
-// SoftAP as the View-T Android app expects it (values recovered from its
-// APK; the trailing space in the SSID is intentional).
-static constexpr char AP_SSID[] = "View-T ";
+// SoftAP defaults (SSID and password can be changed on the /wifi page).
+static constexpr char AP_SSID[] = "AgIsoCanLink";
 static constexpr char AP_PASSWORD[] = "12345678";
 static const IPAddress AP_IP(192, 168, 0, 34);
 static constexpr char HOSTNAME[] = "joystick-auxn";
@@ -52,7 +51,8 @@ static constexpr uint8_t COMMAND_SET_CAN_BAUD_RATE = 0x57;
 static constexpr uint8_t COMMAND_DEVICE_BUSY = 0x48;
 static constexpr uint8_t CAN_BAUD_250K = 0x04;
 
-// Object dictionary entries the View-T app uses during license activation.
+// Object dictionary entries (device ID, license storage, Wi-Fi channel) that
+// clients read and write.
 static constexpr uint16_t OD_DEVICE = 0x3007;
 static constexpr uint8_t OD_DEVICE_ID = 0x02;
 static constexpr uint16_t OD_LICENSE = 0x3009;
@@ -608,7 +608,7 @@ static void tcpTask(void *) {
 // ---------------------------------------------------------------------------
 
 WifiSettings wifi_settings() {
-  preferences.begin("viewt-od", false); // old name kept: holds stored values
+  preferences.begin("canlink-od", false);
   loadObjectDictionary();
   return {HOSTNAME, AP_SSID, AP_PASSWORD, AP_IP, wifiChannel};
 }

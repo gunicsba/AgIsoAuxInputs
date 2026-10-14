@@ -21,7 +21,7 @@ class WebServer;
 
 struct WifiSettings {
   const char *hostname; // mDNS / DHCP name, without ".local"
-  const char *apSsid;
+  const char *apSsid;     // defaults: both can be changed on the /wifi page
   const char *apPassword;
   IPAddress apIp;
   uint8_t apChannel;
