@@ -3,6 +3,9 @@
 #include <Adafruit_NeoPixel.h>
 #include <Arduino.h>
 #include <Preferences.h>
+#include <cstring>
+
+#include "driver/rmt.h"
 
 #include "aux_buttons.h"
 #include "object_pool/object_pool_ids.h"
@@ -20,6 +23,26 @@ static constexpr uint32_t FRAME_MS = 20;             // 50 fps
 static constexpr uint32_t RAINBOW_PERIOD_MS = 5000;  // one full hue turn
 static constexpr uint32_t SAVE_DELAY_MS = 2000;      // batch NVS writes while the operator edits
 static constexpr uint32_t PRESS_FLASH_MS = 200;
+// Unchanged frames are only resent this often (in case a pixel latched noise).
+static constexpr uint32_t REFRESH_MS = 1000;
+
+// The strip is driven by our own RMT channel rather than strip.show(): with
+// ESP-IDF 4.4, Adafruit_NeoPixel installs the RMT driver anew for every frame
+// with a single 48-bit memory block, so a 9-pixel frame (216 bits) needs
+// several refill interrupts mid-frame. When one runs late (CAN or Wi-Fi
+// interrupts, a flash write) the RMT runs dry and the pixels latch garbage -
+// a visible blink. Here the whole frame fits the channel's memory, so the
+// hardware clocks it out without any interrupt. Adafruit_NeoPixel is kept as
+// the pixel buffer and for its colour helpers.
+static constexpr rmt_channel_t LIGHTS_RMT_CHANNEL = RMT_CHANNEL_0;
+static constexpr size_t LIGHTS_BITS = LIGHTS_COUNT * 3 * 8;
+// 40 MHz RMT clock (80 MHz APB / 2): 25 ns per tick, 800 kHz WS2812 timing.
+static constexpr rmt_item32_t LIGHTS_BIT_0 = {{{16, 1, 34, 0}}}; // 0.40 us high, 0.85 us low
+static constexpr rmt_item32_t LIGHTS_BIT_1 = {{{32, 1, 18, 0}}}; // 0.80 us high, 0.45 us low
+static rmt_item32_t rmtItems[LIGHTS_BITS];
+static uint8_t sentPixels[LIGHTS_COUNT * 3];
+static bool rmtReady = false;
+static uint32_t lastSentAt = 0;
 
 enum class LightMode : uint8_t { Rainbow = 0, Colour = 1, White = 2, Count = 3 };
 
@@ -134,6 +157,37 @@ static void onNumericValue(
   markChanged();
 }
 
+static void outputBegin() {
+  rmt_config_t config = RMT_DEFAULT_CONFIG_TX((gpio_num_t)LIGHTS_PIN, LIGHTS_RMT_CHANNEL);
+  config.clk_div = 2;
+  // The frame plus the driver's end marker must fit, or it falls back to
+  // interrupt refills (TX channels can borrow the following channels' blocks).
+  config.mem_block_num =
+      (LIGHTS_BITS + 1 + SOC_RMT_MEM_WORDS_PER_CHANNEL - 1) / SOC_RMT_MEM_WORDS_PER_CHANNEL;
+  rmtReady = rmt_config(&config) == ESP_OK &&
+             rmt_driver_install(LIGHTS_RMT_CHANNEL, 0, 0) == ESP_OK;
+  if (!rmtReady)
+    Serial.println("[LIGHTS] RMT setup failed, LEDs disabled");
+}
+
+// Sends the strip's pixel buffer if it changed (or REFRESH_MS passed).
+static void outputShow(uint32_t now) {
+  const uint8_t *pixels = strip.getPixels(); // already in the strip's colour order
+  if (!rmtReady || (memcmp(pixels, sentPixels, sizeof(sentPixels)) == 0 &&
+                    now - lastSentAt < REFRESH_MS))
+    return;
+  if (rmt_wait_tx_done(LIGHTS_RMT_CHANNEL, 0) != ESP_OK)
+    return; // previous frame still going out; retried next frame
+  size_t n = 0;
+  for (size_t i = 0; i < sizeof(sentPixels); i++) {
+    for (uint8_t mask = 0x80; mask; mask >>= 1)
+      rmtItems[n++] = (pixels[i] & mask) ? LIGHTS_BIT_1 : LIGHTS_BIT_0;
+  }
+  rmt_write_items(LIGHTS_RMT_CHANNEL, rmtItems, n, false);
+  memcpy(sentPixels, pixels, sizeof(sentPixels));
+  lastSentAt = now;
+}
+
 static void render(uint32_t now) {
   bool connected = vt->get_is_connected();
   if (!connected) {
@@ -185,7 +239,7 @@ static void render(uint32_t now) {
     else
       strip.fill(strip.Color(255, 255, 255));
   }
-  strip.show();
+  outputShow(now);
 }
 
 void lights_button_pressed() {
@@ -200,9 +254,9 @@ void lights_setup(std::shared_ptr<isobus::VirtualTerminalClient> vtClient) {
   prefs.begin("lights", false);
   loadSettings();
 
-  strip.begin();
+  outputBegin();
   strip.fill(strip.Color(STATUS_LEVEL, 0, 0)); // no VT yet
-  strip.show();
+  outputShow(millis());
 
   // Soft keys (page / back / on-off) and the on-mask MODE button share one
   // handler: both report the activated object ID.
