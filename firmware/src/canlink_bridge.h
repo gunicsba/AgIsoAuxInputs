@@ -43,7 +43,7 @@ public:
 };
 
 // SoftAP "AgIsoCanLink" at 192.168.0.34; on a configured network the board
-// is joystick-auxn.local.
+// is joystick-auxn.local (all three can be changed on the /wifi page).
 WifiSettings wifi_settings();
 
 // Starts the TCP server task and announces it over mDNS (_canlink._tcp, port

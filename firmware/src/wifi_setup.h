@@ -20,7 +20,7 @@
 class WebServer;
 
 struct WifiSettings {
-  const char *hostname; // mDNS / DHCP name, without ".local"
+  const char *hostname; // mDNS / DHCP name without ".local"; default, editable
   const char *apSsid;     // defaults: both can be changed on the /wifi page
   const char *apPassword;
   IPAddress apIp;
@@ -37,5 +37,13 @@ void wifi_update();
 
 // AP / station summary for the /debug page.
 void wifi_debug_status(String &out);
+
+// Announces a service over mDNS (also after a rename on the /wifi page).
+// service and proto must be string literals (kept by pointer).
+void wifi_add_mdns_service(const char *service, const char *proto, uint16_t port,
+                           const char *txtKey = nullptr, const char *txtValue = nullptr);
+
+// Current mDNS / DHCP name, without ".local".
+const char *wifi_hostname();
 
 #endif

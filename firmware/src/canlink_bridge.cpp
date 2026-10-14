@@ -12,7 +12,6 @@
 #include "canlink_bridge.h"
 
 #include <Arduino.h>
-#include <ESPmDNS.h>
 #include <Preferences.h>
 #include <WiFi.h>
 #include <cstring>
@@ -631,10 +630,9 @@ void begin() {
     debug_log("[BRIDGE] TCP task creation failed; bridge disabled");
     return;
   }
-  MDNS.addService("canlink", "tcp", TCP_PORT);
-  MDNS.addServiceTxt("canlink", "tcp", "id", String(deviceId));
+  wifi_add_mdns_service("canlink", "tcp", TCP_PORT, "id", deviceId);
   debug_log("[BRIDGE] TCP port %u (%s or %s.local), device ID %s", TCP_PORT,
-            AP_IP.toString().c_str(), HOSTNAME, deviceId);
+            AP_IP.toString().c_str(), wifi_hostname(), deviceId);
 }
 
 void debug_status(String &out) {

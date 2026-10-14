@@ -85,7 +85,7 @@ pio run -e joystick -t upload
 pio device monitor
 ```
 
-`joystick_ota` builds the same firmware with a Wi-Fi access point for updates: SSID `joystick-auxn`, password `12345678`. Open `http://192.168.4.1/` for live input values and `/update` to upload a new firmware. On `/wifi` you can change the access point's SSID and password and join an existing network; the board is then also reachable as `http://joystick-auxn.local/`. The access point stays on either way.
+`joystick_ota` builds the same firmware with a Wi-Fi access point for updates: SSID `joystick-auxn`, password `12345678`. Open `http://192.168.4.1/` for live input values and `/update` to upload a new firmware. On `/wifi` you can change the access point's SSID and password, join an existing network, and rename the board; on that network it is reachable as `http://joystick-auxn.local/` (or the name you gave it). The access point stays on either way.
 
 `joystick_canlink` is `joystick_ota` plus a Wi-Fi/CAN bridge that speaks the Proemion CANlink protocol on TCP port 30000, like a CANlink WiFi gateway. A CANlink client becomes the VT, so you can test the pool and aux assignment with nothing else on the CAN bus. An example is AgIsoVirtualTerminal with AgIsoStack's CANlink plugin. Real bus traffic is bridged too. Its access point is `AgIsoCanLink` at `192.168.0.34` (password `12345678`), and the web pages are at `http://192.168.0.34/`. On a joined network the bridge is `joystick-auxn.local:30000`, announced as the mDNS service `_canlink._tcp`. The access point needs `192.168.0.34/24`, so don't join a network that also uses `192.168.0.x`.
 

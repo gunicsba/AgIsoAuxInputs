@@ -8,6 +8,7 @@
 #include <WiFi.h>
 
 #include "debug_log.h"
+#include "esp_netif.h"
 
 static const IPAddress AP_NETMASK(255, 255, 255, 0);
 // A connection attempt scans every channel and the SoftAP follows the radio,
@@ -27,6 +28,19 @@ static String staSsid;
 static String staPassword;
 static String apSsid;
 static String apPassword;
+static String hostname;
+
+// mDNS services, kept so they can be re-announced under a new hostname.
+struct MdnsService {
+  const char *service;
+  const char *proto;
+  uint16_t port;
+  String txtKey;
+  String txtValue;
+};
+static constexpr size_t MAX_MDNS_SERVICES = 4;
+static MdnsService mdnsServices[MAX_MDNS_SERVICES];
+static size_t mdnsServiceCount = 0;
 static uint32_t apRestartAt = 0; // 0 = none pending
 static uint32_t lastStaAttempt = 0;
 static uint32_t staRetryMs = STA_RETRY_MIN_MS;
@@ -97,7 +111,7 @@ static void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
       staConnectedSinceMs = millis();
       debug_log("[WIFI] Joined '%s': %s ch %u %d dBm, http://%s.local/", staSsid.c_str(),
                 WiFi.localIP().toString().c_str(), WiFi.channel(), WiFi.RSSI(),
-                settings.hostname);
+                hostname.c_str());
       if (apSubnetClash())
         debug_log("[WIFI] WARNING: network overlaps the access point's subnet");
       break;
@@ -122,6 +136,33 @@ static void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
     default:
       break;
   }
+}
+
+static void announceService(const MdnsService &entry) {
+  MDNS.addService(entry.service, entry.proto, entry.port);
+  if (!entry.txtKey.isEmpty())
+    MDNS.addServiceTxt(entry.service, entry.proto, entry.txtKey, entry.txtValue);
+}
+
+static void startMdns() {
+  if (!MDNS.begin(hostname.c_str())) {
+    debug_log("[WIFI] mDNS start failed");
+    return;
+  }
+  for (size_t i = 0; i < mdnsServiceCount; i++)
+    announceService(mdnsServices[i]);
+}
+
+// A DNS label: 1-63 of a-z, 0-9 and '-', not starting or ending with '-'.
+static bool validHostname(const String &name) {
+  if (name.isEmpty() || name.length() > 63 || name[0] == '-' ||
+      name[name.length() - 1] == '-')
+    return false;
+  for (char c : name) {
+    if (!(isdigit((unsigned char)c) || (c >= 'a' && c <= 'z') || c == '-'))
+      return false;
+  }
+  return true;
 }
 
 static String stationStatus() {
@@ -167,7 +208,11 @@ static void handleWifiPage() {
           "<p><button>Save access point</button> (reconnect with the new settings)</p></form>";
 
   html += "<h4>Network</h4><p>" + stationStatus() + "</p>";
-  html += "<p>Name: <b>" + String(settings.hostname) + ".local</b></p>";
+  html += "<form method='post' action='/wifi/hostname'>"
+          "<p>Name on the network: <b>" + hostname + ".local</b><br>"
+          "<input name='hostname' maxlength='63' pattern='[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?' "
+          "value='" + hostname + "'> <button>Rename</button><br>"
+          "<small>letters, digits and '-'</small></p></form>";
   if (apSubnetClash()) {
     html += "<p style='color:#b00'>This network overlaps the access point's " +
             settings.apIp.toString() + "/24 - one of them will not work. "
@@ -260,6 +305,26 @@ static void handleApSettings() {
   redirectToWifiPage();
 }
 
+static void handleHostname() {
+  String name = server->arg("hostname");
+  name.trim();
+  name.toLowerCase();
+  if (validHostname(name) && name != hostname) {
+    hostname = name;
+    prefs.putString("hostname", hostname);
+    // Live: mDNS restarts under the new name; the DHCP name is used from the
+    // next station (re)connect.
+    MDNS.end();
+    startMdns();
+    WiFi.setHostname(hostname.c_str());
+    esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (sta != nullptr)
+      esp_netif_set_hostname(sta, hostname.c_str());
+    debug_log("[WIFI] Renamed to %s.local", hostname.c_str());
+  }
+  redirectToWifiPage();
+}
+
 static void handleWifiForget() {
   prefs.remove("ssid");
   prefs.remove("password");
@@ -279,28 +344,42 @@ void wifi_setup(WebServer &webServer, const WifiSettings &wifiSettings) {
   staPassword = prefs.getString("password", "");
   apSsid = prefs.getString("ap_ssid", settings.apSsid);
   apPassword = prefs.getString("ap_password", settings.apPassword);
+  hostname = prefs.getString("hostname", settings.hostname);
+  if (!validHostname(hostname))
+    hostname = settings.hostname;
 
   WiFi.onEvent(onWifiEvent);
   WiFi.persistent(false);       // our own NVS namespace holds the credentials
-  WiFi.setHostname(settings.hostname); // before the STA interface starts
+  WiFi.setHostname(hostname.c_str()); // before the STA interface starts
   WiFi.mode(WIFI_AP_STA);
   WiFi.setSleep(false);         // modem sleep delays TCP to the AP's clients
   WiFi.setAutoReconnect(false); // see STA_RETRY_MIN_MS
   startAccessPoint();
   startStation();
 
-  if (MDNS.begin(settings.hostname)) {
-    MDNS.addService("http", "tcp", 80);
-  } else {
-    debug_log("[WIFI] mDNS start failed");
-  }
+  startMdns();
+  wifi_add_mdns_service("http", "tcp", 80);
 
   server->on("/wifi", HTTP_GET, handleWifiPage);
   server->on("/wifi/scan", HTTP_POST, handleWifiScan);
   server->on("/wifi/save", HTTP_POST, handleWifiSave);
   server->on("/wifi/forget", HTTP_POST, handleWifiForget);
   server->on("/wifi/ap", HTTP_POST, handleApSettings);
+  server->on("/wifi/hostname", HTTP_POST, handleHostname);
 }
+
+void wifi_add_mdns_service(const char *service, const char *proto, uint16_t port,
+                           const char *txtKey, const char *txtValue) {
+  if (mdnsServiceCount == MAX_MDNS_SERVICES) {
+    debug_log("[WIFI] Too many mDNS services, %s not announced", service);
+    return;
+  }
+  MdnsService &entry = mdnsServices[mdnsServiceCount++];
+  entry = {service, proto, port, txtKey ? txtKey : "", txtValue ? txtValue : ""};
+  announceService(entry);
+}
+
+const char *wifi_hostname() { return hostname.c_str(); }
 
 void wifi_update() {
   if (apRestartAt != 0 && (int32_t)(millis() - apRestartAt) >= 0) {
@@ -339,7 +418,7 @@ void wifi_debug_status(String &out) {
            WiFi.disconnectReasonName((wifi_err_reason_t)lastStaDisconnectReason) + ") " +
            String((now - lastStaDisconnectMs) / 1000) + " s ago";
   }
-  out += "\n  hostname " + String(settings.hostname) + ".local, sleep " +
+  out += "\n  hostname " + hostname + ".local, sleep " +
          String(WiFi.getSleep() ? "on" : "off") + "\n";
 }
 
