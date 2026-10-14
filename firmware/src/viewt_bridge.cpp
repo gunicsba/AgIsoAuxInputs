@@ -60,16 +60,22 @@ static constexpr uint16_t OD_SETTINGS = 0x3000;
 static constexpr uint8_t OD_WIFI_CHANNEL = 0x0F;
 static constexpr size_t OD_VALUE_CAPACITY = 64;
 
-// No PSRAM on this build, so queues are sized for internal RAM. TCP batches
-// stay below a normal TCP MSS.
+// No PSRAM on this build, so queues are sized for internal RAM.
 static constexpr UBaseType_t TCP_QUEUE_LENGTH = 512;
 static constexpr UBaseType_t STACK_RX_QUEUE_LENGTH = 256;
-static constexpr size_t TCP_CAN_BATCH_CAPACITY = 1360;
-// Long enough to ride out a Wi-Fi retry burst or a phone's power-save
-// interval; the CAN-to-TCP queue holds several seconds of traffic meanwhile.
-static constexpr uint32_t TCP_WRITE_TIMEOUT_MS = 2000;
+// Bytes handed to the socket but not yet accepted by it. Only whole frames go
+// in, so the stream never breaks mid-frame.
+static constexpr size_t TCP_TX_BUFFER_SIZE = 2048;
+// A client that stops reading (zero TCP window) keeps its session: ISOBUS
+// recovers from lost frames by itself (VT status timeout, TP timeouts), while
+// a closed connection is fatal for a client that doesn't reconnect. Frames
+// that don't fit the CAN-to-TCP queue meanwhile are dropped, and after a
+// stall this long the backlog is discarded rather than delivered stale.
+static constexpr uint32_t TCP_STALL_LOG_MS = 500;
+static constexpr uint32_t TCP_STALE_BACKLOG_MS = 1000;
 // Dead peer (e.g. phone left the AP without closing) detected after
-// idle + interval * count seconds.
+// idle + interval * count seconds. (Keepalive only probes an idle link; a
+// stalled one is left to the stall handling above.)
 static constexpr int TCP_KEEPALIVE_IDLE_S = 5;
 static constexpr int TCP_KEEPALIVE_INTERVAL_S = 2;
 static constexpr int TCP_KEEPALIVE_COUNT = 3;
@@ -102,7 +108,6 @@ static uint8_t wifiChannel = 1;
 
 static volatile uint32_t activeTcpGeneration = 0;
 static uint32_t nextTcpGeneration = 1;
-static volatile uint32_t tcpQueueFaultGeneration = 0;
 
 static volatile uint32_t busRxCount = 0;
 static volatile uint32_t tabletRxCount = 0;
@@ -110,7 +115,21 @@ static volatile uint32_t tcpTxFrameCount = 0;
 static volatile uint32_t tcpQueueDropCount = 0;
 static volatile uint32_t stackQueueDropCount = 0;
 static volatile uint32_t busTxFailCount = 0;
-static uint32_t tcpWriteFailureCount = 0;
+static uint32_t tcpWriteErrorCount = 0;
+
+// Outgoing bytes (tcpTask only): txBuffer[txSent..txLength) is still unsent.
+static uint8_t txBuffer[TCP_TX_BUFFER_SIZE];
+static size_t txLength = 0;
+static size_t txSent = 0;
+
+// Client stalls (tcpTask only)
+static uint32_t stallStartMs = 0; // 0 = not stalled
+static uint32_t stallStartQueueDrops = 0;
+static bool stallLogged = false;
+static bool discardBacklog = false;
+static uint32_t stallCount = 0;
+static uint32_t longestStallMs = 0;
+static uint32_t staleFramesDiscarded = 0;
 
 // Session bookkeeping for /debug (tcpTask only)
 static String tabletAddress;
@@ -156,10 +175,7 @@ static void queueForTablet(uint32_t canId, const uint8_t *data, uint8_t dlc) {
   if (!length) return;
   frame.connectionGeneration = generation;
   frame.length = (uint8_t)length;
-  if (xQueueSend(tcpQueue, &frame, 0) != pdTRUE) {
-    ++tcpQueueDropCount;
-    tcpQueueFaultGeneration = generation;
-  }
+  if (xQueueSend(tcpQueue, &frame, 0) != pdTRUE) ++tcpQueueDropCount;
 }
 
 static void queueForStack(const isobus::CANMessageFrame &frame) {
@@ -252,6 +268,9 @@ static void closeTcpClient(const String &reason) {
   activeTcpGeneration = 0;
   tcpClient.stop();
   tcpBufferLength = 0;
+  txLength = txSent = 0;
+  stallStartMs = 0;
+  stallLogged = discardBacklog = false;
   lastCloseReason = reason;
   lastCloseMs = millis();
   debug_log("[BRIDGE] Tablet %s disconnected after %lu s (%lu frames out, %lu in): %s",
@@ -260,71 +279,102 @@ static void closeTcpClient(const String &reason) {
             (unsigned long)(tabletRxCount - sessionStartRxFrames), reason.c_str());
 }
 
-static bool sendToTcp(const uint8_t *data, size_t length) {
-  if (activeTcpGeneration == 0 || !tcpClient.connected()) return false;
+// Whole frames only: false (frame dropped) if it doesn't fit.
+static bool appendToTx(const uint8_t *data, size_t length) {
+  if (txSent == txLength) {
+    txSent = txLength = 0;
+  } else if (txLength + length > sizeof(txBuffer)) {
+    memmove(txBuffer, txBuffer + txSent, txLength - txSent);
+    txLength -= txSent;
+    txSent = 0;
+  }
+  if (txLength + length > sizeof(txBuffer)) return false;
+  memcpy(txBuffer + txLength, data, length);
+  txLength += length;
+  return true;
+}
 
-  const int socketFd = tcpClient.fd();
-  const uint32_t startedAt = millis();
-  size_t sent = 0;
-  int error = 0;
-  while (sent < length && tcpClient.connected()) {
-    const int result = lwip_send(socketFd, data + sent, length - sent, MSG_DONTWAIT);
+static void endStall() {
+  const uint32_t stalledMs = millis() - stallStartMs;
+  stallStartMs = 0;
+  if (stalledMs > longestStallMs) longestStallMs = stalledMs;
+  if (stalledMs >= TCP_STALE_BACKLOG_MS) discardBacklog = true;
+  if (stallLogged) {
+    stallLogged = false;
+    debug_log("[BRIDGE] Tablet reading again after %lu ms (%lu frames dropped meanwhile)",
+              (unsigned long)stalledMs,
+              (unsigned long)(tcpQueueDropCount - stallStartQueueDrops));
+  }
+}
+
+// Sends as much of txBuffer as the socket takes, without blocking. False if
+// the connection had to be closed.
+static bool flushTx() {
+  if (activeTcpGeneration == 0) return false;
+  while (txSent < txLength) {
+    const int result = lwip_send(tcpClient.fd(), txBuffer + txSent, txLength - txSent,
+                                 MSG_DONTWAIT);
     if (result > 0) {
-      sent += (size_t)result;
+      txSent += (size_t)result;
       continue;
     }
-    if (result < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-      error = errno;
-      break;
+    if (result == 0 || errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+      if (stallStartMs == 0) {
+        stallStartMs = millis() | 1; // never 0 while stalled
+        stallStartQueueDrops = tcpQueueDropCount;
+      }
+      return true; // retried on the next round
     }
-    if ((uint32_t)(millis() - startedAt) >= TCP_WRITE_TIMEOUT_MS) break;
-    vTaskDelay(1);
+    const int error = errno;
+    ++tcpWriteErrorCount;
+    char reason[64];
+    snprintf(reason, sizeof(reason), "write error %d (%s)", error, strerror(error));
+    closeTcpClient(reason);
+    return false;
   }
-
-  if (sent == length) return true;
-  ++tcpWriteFailureCount;
-  char reason[96];
-  if (error != 0) {
-    snprintf(reason, sizeof(reason), "write error %d (%s), %u/%u bytes sent", error,
-             strerror(error), (unsigned)sent, (unsigned)length);
-  } else if (!tcpClient.connected()) {
-    snprintf(reason, sizeof(reason), "connection lost while writing, %u/%u bytes sent",
-             (unsigned)sent, (unsigned)length);
-  } else {
-    snprintf(reason, sizeof(reason), "write stalled for %lu ms, %u/%u bytes sent",
-             (unsigned long)TCP_WRITE_TIMEOUT_MS, (unsigned)sent, (unsigned)length);
-  }
-  closeTcpClient(reason);
-  return false;
+  if (stallStartMs != 0) endStall();
+  return true;
 }
 
 static void sendQueuedFrames() {
-  if (activeTcpGeneration == 0) return;
-  if (tcpQueueFaultGeneration == activeTcpGeneration) {
-    // The app has no way to detect a lost frame, so a gap must end the session.
-    closeTcpClient("CAN-to-TCP queue overflow");
+  if (!flushTx()) return;
+  const uint32_t generation = activeTcpGeneration;
+  QueuedTcpFrame frame;
+
+  if (txSent < txLength) {
+    // Still stalled: leave the frames queued; what doesn't fit is dropped by
+    // queueForTablet().
+    if (!stallLogged && millis() - stallStartMs >= TCP_STALL_LOG_MS) {
+      stallLogged = true;
+      ++stallCount;
+      debug_log("[BRIDGE] Tablet %s stopped reading; keeping the session, dropping "
+                "frames until it resumes", tabletAddress.c_str());
+    }
     return;
   }
 
-  uint8_t batch[TCP_CAN_BATCH_CAPACITY];
-  size_t batchLength = 0;
-  uint32_t batchFrames = 0;
-  QueuedTcpFrame frame;
-  const uint32_t generation = activeTcpGeneration;
+  if (discardBacklog) {
+    discardBacklog = false;
+    uint32_t discarded = 0;
+    while (xQueueReceive(tcpQueue, &frame, 0) == pdTRUE) {
+      if (frame.connectionGeneration == generation) ++discarded;
+    }
+    staleFramesDiscarded += discarded;
+    if (discarded) debug_log("[BRIDGE] Discarded %lu stale frames", (unsigned long)discarded);
+  }
 
+  uint32_t frames = 0;
   while (xQueuePeek(tcpQueue, &frame, 0) == pdTRUE) {
     if (frame.connectionGeneration != generation) {
       xQueueReceive(tcpQueue, &frame, 0); // stale, from a previous connection
       continue;
     }
-    if (batchLength + frame.length > sizeof(batch)) break;
-    if (xQueueReceive(tcpQueue, &frame, 0) != pdTRUE) break;
-    memcpy(batch + batchLength, frame.data, frame.length);
-    batchLength += frame.length;
-    ++batchFrames;
+    if (!appendToTx(frame.data, frame.length)) break; // full: next round
+    xQueueReceive(tcpQueue, &frame, 0);
+    ++frames;
   }
-
-  if (batchLength && sendToTcp(batch, batchLength)) tcpTxFrameCount += batchFrames;
+  tcpTxFrameCount += frames;
+  flushTx();
 }
 
 static bool sendFrame(uint8_t type, const uint8_t *header, size_t headerLength,
@@ -341,7 +391,8 @@ static bool sendFrame(uint8_t type, const uint8_t *header, size_t headerLength,
   pos += dataLength;
   frame[pos] = xorChecksum(frame, pos);
   frame[pos + 1] = EOF_BYTE;
-  return sendToTcp(frame, pos + 2);
+  if (activeTcpGeneration == 0 || !appendToTx(frame, pos + 2)) return false;
+  return flushTx();
 }
 
 static void loadObjectDictionary() {
@@ -491,6 +542,7 @@ static bool processOneTcpFrame() {
     if ((canId & ~CAN_ID_MASK) == 0) handleTabletCanFrame(canId, tcpBuffer + 7, bodyLength - 5);
   }
 
+  if (activeTcpGeneration == 0) return false; // a reply failed and closed the session
   memmove(tcpBuffer, tcpBuffer + totalLength, tcpBufferLength - totalLength);
   tcpBufferLength -= totalLength;
   return true;
@@ -532,7 +584,7 @@ static void acceptTcpClient() {
   xQueueReset(tcpQueue);
   uint32_t generation = nextTcpGeneration++;
   if (generation == 0) generation = nextTcpGeneration++;
-  tcpQueueFaultGeneration = 0;
+  txLength = txSent = 0;
   tabletAddress = tcpClient.remoteIP().toString() + ":" + String(tcpClient.remotePort());
   sessionStartMs = millis();
   sessionStartTxFrames = tcpTxFrameCount;
@@ -600,19 +652,24 @@ void debug_status(String &out) {
   out += "\n  frames: bus rx " + String(busRxCount) + ", tablet rx " + String(tabletRxCount) +
          ", tcp tx " + String(tcpTxFrameCount) + ", queued " +
          String(tcpQueue ? uxQueueMessagesWaiting(tcpQueue) : 0) + "\n";
-  out += "  drops: tcp queue " + String(tcpQueueDropCount) + ", stack queue " +
-         String(stackQueueDropCount) + ", bus tx " + String(busTxFailCount) +
-         ", tcp write " + String(tcpWriteFailureCount) + "\n";
+  out += "  drops: tcp queue " + String(tcpQueueDropCount) + ", stale after stall " +
+         String(staleFramesDiscarded) + ", stack queue " + String(stackQueueDropCount) +
+         ", bus tx " + String(busTxFailCount) + ", tcp write errors " +
+         String(tcpWriteErrorCount) + "\n";
+  out += "  tablet stalls " + String(stallCount) + ", longest " + String(longestStallMs) +
+         " ms";
+  if (stallStartMs != 0) out += ", stalled now for " + String(now - stallStartMs) + " ms";
+  out += "\n";
 }
 
 void print_status() {
   Serial.printf("[BRIDGE] tablet=%d bus_rx=%lu tablet_rx=%lu tcp_tx=%lu tcp_queued=%u "
-                "tcp_drop=%lu stack_drop=%lu bus_tx_fail=%lu tcp_fail=%lu\n",
+                "tcp_drop=%lu stack_drop=%lu bus_tx_fail=%lu tcp_err=%lu\n",
                 activeTcpGeneration != 0, (unsigned long)busRxCount,
                 (unsigned long)tabletRxCount, (unsigned long)tcpTxFrameCount,
                 tcpQueue ? (unsigned)uxQueueMessagesWaiting(tcpQueue) : 0,
                 (unsigned long)tcpQueueDropCount, (unsigned long)stackQueueDropCount,
-                (unsigned long)busTxFailCount, (unsigned long)tcpWriteFailureCount);
+                (unsigned long)busTxFailCount, (unsigned long)tcpWriteErrorCount);
 }
 
 } // namespace viewt_bridge
