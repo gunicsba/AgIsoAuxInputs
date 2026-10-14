@@ -2,7 +2,7 @@
  * Wi-Fi: an always-on SoftAP plus, once configured on the /wifi page, a
  * station connection to an existing network.
  *
- * The SoftAP keeps the setup page (and the View-T bridge) reachable even when
+ * The SoftAP keeps the setup page (and the CANlink bridge) reachable even when
  * the configured network is gone. On the station side the board announces
  * itself over mDNS as http://<hostname>.local, so a VT/PC on that network
  * doesn't need to know the DHCP address.

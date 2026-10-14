@@ -1,9 +1,10 @@
 /*
- * View-T Wi-Fi/CAN bridge (Proemion Byte Command Protocol over TCP).
+ * Wi-Fi/CAN bridge speaking the Proemion CANlink Byte Command Protocol over
+ * TCP port 30000, like a CANlink WiFi gateway.
  *
- * Lets the View-T Android app act as the VT for this AUX-N device without
- * any other CAN hardware: the app connects to the SoftAP, and every CAN
- * frame is exchanged with it over TCP port 30000.
+ * Any CANlink client (e.g. AgIsoVirtualTerminal with AgIsoStack's CANlink
+ * plugin, or the View-T Android app) can join the bus through it and act as
+ * the VT for this AUX-N device without other CAN hardware.
  *
  * The ESP32-S3 has a single TWAI controller and AgIsoStack's TWAIPlugin
  * normally owns twai_receive(), so a second reader would steal frames from
@@ -21,16 +22,16 @@
  */
 #pragma once
 
-#if defined(ENABLE_VIEWT_BRIDGE)
+#if defined(ENABLE_CANLINK_BRIDGE)
 
 #if !defined(ENABLE_OTA_WEBSERVER)
-#error "The View-T bridge needs ENABLE_OTA_WEBSERVER for its Wi-Fi setup"
+#error "The CANlink bridge needs ENABLE_OTA_WEBSERVER for its Wi-Fi setup"
 #endif
 
 #include "isobus/hardware_integration/twai_plugin.hpp"
 #include "wifi_setup.h"
 
-namespace viewt_bridge {
+namespace canlink_bridge {
 
 class BridgedTWAIPlugin : public isobus::TWAIPlugin {
 public:
@@ -41,11 +42,11 @@ public:
   bool write_frame(const isobus::CANMessageFrame &canFrame) override;
 };
 
-// The View-T app expects SSID "View-T " at 192.168.0.34; the board is
-// viewt.local on a configured network.
+// SoftAP at 192.168.0.34 (named for the View-T app, which looks for it); on a
+// configured network the board is joystick-auxn.local.
 WifiSettings wifi_settings();
 
-// Starts the TCP server task and announces it over mDNS (_viewt._tcp, port
+// Starts the TCP server task and announces it over mDNS (_canlink._tcp, port
 // 30000). Call after wifi_setup() and CANHardwareInterface::start().
 void begin();
 
@@ -58,6 +59,6 @@ void print_status();
 // Session and counter summary for the /debug page.
 void debug_status(String &out);
 
-} // namespace viewt_bridge
+} // namespace canlink_bridge
 
 #endif

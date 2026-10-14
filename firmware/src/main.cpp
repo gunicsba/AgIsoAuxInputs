@@ -41,7 +41,7 @@
 #include "object_pool/aux_n_pool_justify.h"
 #include "settings.h"
 #include "object_pool/object_pool_ids.h"
-#include "viewt_bridge.h"
+#include "canlink_bridge.h"
 #include "wifi_setup.h"
 
 #if defined(ENABLE_OTA_WEBSERVER)
@@ -91,8 +91,8 @@ public:
 };
 static ArduinoCANStackLogger canStackLogger;
 
-#if defined(ENABLE_VIEWT_BRIDGE)
-using BaseTWAIPlugin = viewt_bridge::BridgedTWAIPlugin;
+#if defined(ENABLE_CANLINK_BRIDGE)
+using BaseTWAIPlugin = canlink_bridge::BridgedTWAIPlugin;
 #else
 using BaseTWAIPlugin = isobus::TWAIPlugin;
 #endif
@@ -419,9 +419,9 @@ static void handleDebug() {
   }
   out += "\n";
   wifi_debug_status(out);
-#if defined(ENABLE_VIEWT_BRIDGE)
+#if defined(ENABLE_CANLINK_BRIDGE)
   out += "\n";
-  viewt_bridge::debug_status(out);
+  canlink_bridge::debug_status(out);
 #endif
   out += "\nLog (newest last)\n";
   debug_log_dump(out);
@@ -429,8 +429,8 @@ static void handleDebug() {
 }
 
 static void ota_setup() {
-#if defined(ENABLE_VIEWT_BRIDGE)
-  wifi_setup(otaServer, viewt_bridge::wifi_settings());
+#if defined(ENABLE_CANLINK_BRIDGE)
+  wifi_setup(otaServer, canlink_bridge::wifi_settings());
 #else
   wifi_setup(otaServer, {"joystick-auxn", "joystick-auxn", "12345678",
                          IPAddress(192, 168, 4, 1), 1});
@@ -491,8 +491,8 @@ void setup() {
 #if defined(ENABLE_OTA_WEBSERVER)
   ota_setup(); // Wi-Fi + mDNS, which the bridge needs
 #endif
-#if defined(ENABLE_VIEWT_BRIDGE)
-  viewt_bridge::begin();
+#if defined(ENABLE_CANLINK_BRIDGE)
+  canlink_bridge::begin();
 #endif
 
   digitalWrite(LED1_PIN, LOW); // ready
@@ -523,8 +523,8 @@ static void printStatus() {
                 (unsigned long)twaiStatus.arb_lost_count,
                 (unsigned long)twaiStatus.bus_error_count,
                 (unsigned long)twaiStatus.msgs_to_tx);
-#if defined(ENABLE_VIEWT_BRIDGE)
-  viewt_bridge::print_status();
+#if defined(ENABLE_CANLINK_BRIDGE)
+  canlink_bridge::print_status();
 #endif
 }
 

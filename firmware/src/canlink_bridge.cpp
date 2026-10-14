@@ -1,14 +1,15 @@
 /*
- * View-T Wi-Fi/CAN bridge - see viewt_bridge.h.
+ * Wi-Fi/CAN bridge (Proemion CANlink Byte Command Protocol) - see
+ * canlink_bridge.h.
  *
  * Ported from the standalone M5Stack Core2 bridge (ISOBUS_DEMO/
  * proeminon_main.cpp). Differences: the TWAI controller is shared with the
  * ISOBUS stack through BridgedTWAIPlugin, the CAN baud rate is fixed at
  * ISOBUS's 250 kbit/s, and the device ID is this board's own MAC.
  */
-#if defined(ENABLE_VIEWT_BRIDGE)
+#if defined(ENABLE_CANLINK_BRIDGE)
 
-#include "viewt_bridge.h"
+#include "canlink_bridge.h"
 
 #include <Arduino.h>
 #include <ESPmDNS.h>
@@ -24,13 +25,14 @@
 
 #include "debug_log.h"
 
-namespace viewt_bridge {
+namespace canlink_bridge {
 
-// View-T values recovered from the APK.
-static constexpr char AP_SSID[] = "View-T "; // trailing space is intentional
+// SoftAP as the View-T Android app expects it (values recovered from its
+// APK; the trailing space in the SSID is intentional).
+static constexpr char AP_SSID[] = "View-T ";
 static constexpr char AP_PASSWORD[] = "12345678";
 static const IPAddress AP_IP(192, 168, 0, 34);
-static constexpr char HOSTNAME[] = "viewt";
+static constexpr char HOSTNAME[] = "joystick-auxn";
 static constexpr uint16_t TCP_PORT = 30000;
 
 static constexpr uint8_t SOF = 0x43;
@@ -50,7 +52,7 @@ static constexpr uint8_t COMMAND_SET_CAN_BAUD_RATE = 0x57;
 static constexpr uint8_t COMMAND_DEVICE_BUSY = 0x48;
 static constexpr uint8_t CAN_BAUD_250K = 0x04;
 
-// Object dictionary entries used by the View-T app during license activation.
+// Object dictionary entries the View-T app uses during license activation.
 static constexpr uint16_t OD_DEVICE = 0x3007;
 static constexpr uint8_t OD_DEVICE_ID = 0x02;
 static constexpr uint16_t OD_LICENSE = 0x3009;
@@ -149,7 +151,7 @@ static uint8_t xorChecksum(const uint8_t *data, size_t length) {
   return result;
 }
 
-static size_t encodeViewT(uint32_t canId, const uint8_t *data, uint8_t dlc,
+static size_t encodeCanFrame(uint32_t canId, const uint8_t *data, uint8_t dlc,
                           uint8_t *out, size_t capacity) {
   if ((canId & ~CAN_ID_MASK) != 0 || dlc > 8 || capacity < (size_t)dlc + 9) return 0;
   out[0] = SOF;
@@ -170,7 +172,7 @@ static void queueForTablet(uint32_t canId, const uint8_t *data, uint8_t dlc) {
   const uint32_t generation = activeTcpGeneration;
   if (generation == 0 || tcpQueue == nullptr) return;
   QueuedTcpFrame frame;
-  const size_t length = encodeViewT(canId, data, dlc > 8 ? 8 : dlc, frame.data,
+  const size_t length = encodeCanFrame(canId, data, dlc > 8 ? 8 : dlc, frame.data,
                                     sizeof(frame.data));
   if (!length) return;
   frame.connectionGeneration = generation;
@@ -606,7 +608,7 @@ static void tcpTask(void *) {
 // ---------------------------------------------------------------------------
 
 WifiSettings wifi_settings() {
-  preferences.begin("viewt-od", false);
+  preferences.begin("viewt-od", false); // old name kept: holds stored values
   loadObjectDictionary();
   return {HOSTNAME, AP_SSID, AP_PASSWORD, AP_IP, wifiChannel};
 }
@@ -625,19 +627,19 @@ void begin() {
   tcpServer.begin();
   tcpServer.setNoDelay(true);
 
-  if (xTaskCreatePinnedToCore(tcpTask, "viewt-tcp", 6144, nullptr, 2, nullptr, 0) != pdPASS) {
+  if (xTaskCreatePinnedToCore(tcpTask, "canlink-tcp", 6144, nullptr, 2, nullptr, 0) != pdPASS) {
     debug_log("[BRIDGE] TCP task creation failed; bridge disabled");
     return;
   }
-  MDNS.addService("viewt", "tcp", TCP_PORT);
-  MDNS.addServiceTxt("viewt", "tcp", "id", String(deviceId));
+  MDNS.addService("canlink", "tcp", TCP_PORT);
+  MDNS.addServiceTxt("canlink", "tcp", "id", String(deviceId));
   debug_log("[BRIDGE] TCP port %u (%s or %s.local), device ID %s", TCP_PORT,
             AP_IP.toString().c_str(), HOSTNAME, deviceId);
 }
 
 void debug_status(String &out) {
   const uint32_t now = millis();
-  out += "View-T bridge (port " + String(TCP_PORT) + ", device ID " + String(deviceId) + ")\n";
+  out += "CANlink bridge (port " + String(TCP_PORT) + ", device ID " + String(deviceId) + ")\n";
   if (activeTcpGeneration != 0) {
     out += "  tablet " + tabletAddress + ", connected " +
            String((now - sessionStartMs) / 1000) + " s, " +
@@ -672,6 +674,6 @@ void print_status() {
                 (unsigned long)busTxFailCount, (unsigned long)tcpWriteErrorCount);
 }
 
-} // namespace viewt_bridge
+} // namespace canlink_bridge
 
 #endif

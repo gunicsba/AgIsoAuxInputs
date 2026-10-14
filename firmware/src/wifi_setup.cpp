@@ -177,7 +177,7 @@ static void handleWifiPage() {
           "<p><button>Connect</button></p></form>";
 
   // Scans only on request: the radio leaves the AP's channel while it scans,
-  // which drops TCP sessions to the AP (the View-T app).
+  // which drops TCP sessions to the AP (the CANlink bridge's clients).
   if (scanCount == WIFI_SCAN_RUNNING) {
     html += "<p>Scanning...</p>";
   } else {

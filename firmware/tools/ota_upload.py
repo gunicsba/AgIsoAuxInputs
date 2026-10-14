@@ -1,6 +1,6 @@
 """PlatformIO script adding an "ota" target: upload the firmware over Wi-Fi.
 
-    pio run -e joystick_viewt -t ota [--upload-port HOST]
+    pio run -e joystick_canlink -t ota [--upload-port HOST]
 
 Builds, POSTs the .bin to the board's /update page (ESP2SOTA), then waits
 for the board to come back and prints the commit it now runs (from /debug).
