@@ -90,7 +90,7 @@ Pick `joystick_canlink` if you're not sure. It has the web pages, Wi-Fi updates 
 
 1. Put the board into download mode: hold **BOOT**, tap **RST**, then release **BOOT**. Or hold **BOOT** while you plug in the USB cable. The board doesn't do this on its own.
 2. Open [espressif.github.io/esptool-js](https://espressif.github.io/esptool-js/), click **Connect** and pick the board's serial port. On Windows it's a USB serial device (`303A:1001`).
-3. Under **Flash Address**, keep `0x0` and choose the `-full.bin` file. Click **Program** and wait for it to finish.
+3. Change **Flash Address** from its default `0x1000` to `0x0`. `0x1000` is right for the original ESP32, but on this ESP32-S3 the board won't boot (`Invalid image block, can't boot` in a reset loop). Choose the `-full.bin` file, click **Program** and wait for it to finish.
 4. Press **RST** to start the new firmware. The board won't reboot itself after flashing.
 
 ### Later updates, over Wi-Fi
