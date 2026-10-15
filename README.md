@@ -50,6 +50,8 @@ git push origin v1.0.0
 
 [tools/package_release.py](tools/package_release.py) builds the same ZIPs locally into `dist/`. After a `pio run` of each firmware env, [tools/package_firmware.py](tools/package_firmware.py) adds the firmware images there.
 
+Every pull request runs the same build. Its firmware images are attached to the workflow run as an artifact (`AgIsoAuxInputs-pr<number>-<commit>`), so you can test a PR on a board before it's merged.
+
 ## Devices
 
 ### Joystick
