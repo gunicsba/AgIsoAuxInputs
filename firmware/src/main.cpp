@@ -7,9 +7,12 @@
  * assigned to implement functions through the VT's normal aux-assignment
  * screen.
  *
- * Object pool: one Working Set + one Data Mask showing "TEST" (enough to
- * confirm the pool uploaded), plus 20 Auxiliary Input Type 2 objects (4
- * analog channels from the ADS1115, 16 buttons from the extender PCA9555).
+ * Object pool: one Working Set, a main Data Mask drawing the handgrip (each
+ * button highlights while pressed; the firmware commit is shown at the
+ * bottom), a "Lights" Data Mask controlling the addressable LEDs on GPIO7
+ * (see lights.cpp) with soft keys to switch between them, plus 20 Auxiliary
+ * Input Type 2 objects (4 analog channels from the ADS1115, 16 buttons from
+ * the extender PCA9555).
  * The pool binary is built offline by tools/build_aux_pool.py, which emits
  * both a standalone .iop file (for reference/upload tools) and the embedded
  * C byte array in object_pool/aux_n_pool_data.h that this file actually
@@ -30,8 +33,16 @@
 #include "isobus/isobus/isobus_virtual_terminal_client.hpp"
 #include "isobus/utility/iop_file_interface.hpp"
 
+#include "git_version.h"
+#include "aux_buttons.h"
+#include "debug_log.h"
+#include "lights.h"
 #include "object_pool/aux_n_pool_data.h"
+#include "object_pool/aux_n_pool_justify.h"
+#include "settings.h"
 #include "object_pool/object_pool_ids.h"
+#include "canlink_bridge.h"
+#include "wifi_setup.h"
 
 #if defined(ENABLE_OTA_WEBSERVER)
 #include <ESP2SOTA.h>
@@ -70,19 +81,62 @@ class ArduinoCANStackLogger : public isobus::CANStackLogger {
 public:
   void sink_CAN_stack_log(CANStackLogger::LoggingLevel level,
                            const std::string &text) override {
-    (void)level;
-    Serial.println(text.c_str());
+    // Debug level is chatty (every TP session...): serial only, so the
+    // /debug log keeps the VT handshake, warnings and errors.
+    if (level >= LoggingLevel::Info)
+      debug_log("%s", text.c_str());
+    else
+      Serial.println(text.c_str());
   }
 };
 static ArduinoCANStackLogger canStackLogger;
+
+#if defined(ENABLE_CANLINK_BRIDGE)
+using BaseTWAIPlugin = canlink_bridge::BridgedTWAIPlugin;
+#else
+using BaseTWAIPlugin = isobus::TWAIPlugin;
+#endif
+
+// TWAIPlugin with a minimum gap between transmitted frames. Back-to-back
+// TP data frames during an object pool upload drove the bus to bus-off on
+// every attempt (most likely the VT's CAN adapter overrunning and answering
+// with error frames). A write refused here stays queued in the stack and is
+// retried on the next update().
+class PacedTWAIPlugin : public BaseTWAIPlugin {
+public:
+  using BaseTWAIPlugin::BaseTWAIPlugin;
+
+  bool write_frame(const isobus::CANMessageFrame &canFrame) override {
+    uint32_t now = micros();
+    if (now - lastTxMicros < MIN_TX_GAP_US)
+      return false;
+    if (!BaseTWAIPlugin::write_frame(canFrame))
+      return false;
+    lastTxMicros = now;
+    return true;
+  }
+
+private:
+  static constexpr uint32_t MIN_TX_GAP_US = 2000;
+  uint32_t lastTxMicros = 0;
+};
 
 static Adafruit_ADS1115 ads;
 static std::shared_ptr<isobus::VirtualTerminalClient> vtClient = nullptr;
 static std::shared_ptr<isobus::InternalControlFunction> internalECU = nullptr;
 
+// Mutable RAM copy of the selected pool: set_object_pool() reads from this
+// pointer lazily as the pool uploads, so the VT4 justification upgrade below
+// (once the connected VT's version is known) has to patch a writable buffer.
+static uint8_t poolBuffer[AUX_N_POOL_MULTI_SIZE > AUX_N_POOL_SINGLE_SIZE
+                             ? AUX_N_POOL_MULTI_SIZE
+                             : AUX_N_POOL_SINGLE_SIZE];
+static const AuxPoolJustifyUpgrade *poolJustifyUpgrades = nullptr;
+static uint32_t poolJustifyUpgradeCount = 0;
+static bool poolJustificationChecked = false;
+
 static uint16_t analogValues[NUM_AUX_ANALOG] = {0};
-static bool buttonStates[NUM_AUX_BUTTONS] = {false};
-static uint16_t buttonTransitions[NUM_AUX_BUTTONS] = {0};
+static bool buttonStates[NUM_AUX_BUTTONS] = {false}; // for the log / OTA page
 
 static uint32_t lastPollTime = 0;
 static uint32_t lastForceResync = 0;
@@ -109,6 +163,20 @@ uint8_t pca9555_read(uint8_t addr, uint8_t reg) {
   return 0xFF;
 }
 
+// A (re)connected VT shows the pool's initial values: fill in the firmware
+// commit. (Button highlights are restored by aux_buttons_update().)
+static void syncCommitOnConnect() {
+  static bool wasConnected = false;
+  bool connected = vtClient->get_is_connected();
+  if (connected && !wasConnected) {
+    char commit[COMMIT_TEXT_LENGTH + 1];
+    snprintf(commit, sizeof(commit), "%*s", COMMIT_TEXT_LENGTH,
+             GIT_COMMIT_SHORT); // right-aligned, padded to the pool length
+    vtClient->send_change_string_value(STR_COMMIT, commit);
+  }
+  wasConnected = connected;
+}
+
 static void pollInputsAndReport(bool forceResync) {
   // 4 ADS1115 channels -> analog AUX-N inputs (maintains-position pots)
   for (uint8_t ch = 0; ch < NUM_AUX_ANALOG; ch++) {
@@ -124,23 +192,19 @@ static void pollInputsAndReport(bool forceResync) {
     }
   }
 
-  // 16 extender PCA9555 buttons -> momentary boolean AUX-N inputs
+  // 16 extender PCA9555 buttons -> momentary boolean AUX-N inputs (single
+  // or multi-page, see aux_buttons.cpp)
   if (pcaExtAddr != 0) {
     uint8_t port0 = ~pca9555_read(pcaExtAddr, PCA9555_REG_INPUT0);
     uint8_t port1 = ~pca9555_read(pcaExtAddr, PCA9555_REG_INPUT1);
     uint16_t raw = (uint16_t)port0 | ((uint16_t)port1 << 8);
+    aux_buttons_report(raw, forceResync);
     bool anyChanged = false;
     for (uint8_t i = 0; i < NUM_AUX_BUTTONS; i++) {
       bool pressed = (raw & (1u << i)) != 0;
-      if (forceResync || pressed != buttonStates[i]) {
-        if (pressed != buttonStates[i]) {
-          buttonStates[i] = pressed;
-          buttonTransitions[i]++;
-          anyChanged = true;
-        }
-        vtClient->update_auxiliary_input(AUX_BUTTON_IDS[i],
-                                          buttonStates[i] ? 1 : 0,
-                                          buttonTransitions[i]);
+      if (pressed != buttonStates[i]) {
+        buttonStates[i] = pressed;
+        anyChanged = true;
       }
     }
     if (anyChanged) {
@@ -182,13 +246,23 @@ static void setupIsobus() {
   isobus::CANStackLogger::set_log_level(
       isobus::CANStackLogger::LoggingLevel::Debug);
 
-  twai_general_config_t twaiConfig = TWAI_GENERAL_CONFIG_DEFAULT(
+  // Static: TWAIPlugin keeps pointers to these configs.
+  static twai_general_config_t twaiConfig = TWAI_GENERAL_CONFIG_DEFAULT(
       (gpio_num_t)CAN_TX_PIN, (gpio_num_t)CAN_RX_PIN, TWAI_MODE_NORMAL);
-  twai_timing_config_t twaiTiming = TWAI_TIMING_CONFIG_250KBITS();
-  twai_filter_config_t twaiFilter = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+  // The default 5-frame queues overflow during an object pool upload while
+  // loop() is busy elsewhere (I2C reads, LEDs), dropping the VT's TP
+  // flow-control frames until its session times out.
+  twaiConfig.rx_queue_len = 64;
+  twaiConfig.tx_queue_len = 32;
+  static twai_timing_config_t twaiTiming = TWAI_TIMING_CONFIG_250KBITS();
+  static twai_filter_config_t twaiFilter = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+  // Zero timeouts: without threads, update() reads one frame per call, and
+  // the default 100 ms blocking receive would stall loop() whenever the bus
+  // is quiet. A failed non-blocking write stays queued in the stack and is
+  // retried on the next update().
   std::shared_ptr<isobus::CANHardwarePlugin> canDriver =
-      std::make_shared<isobus::TWAIPlugin>(&twaiConfig, &twaiTiming,
-                                            &twaiFilter);
+      std::make_shared<PacedTWAIPlugin>(&twaiConfig, &twaiTiming,
+                                         &twaiFilter, 0, 0);
 
   isobus::CANHardwareInterface::set_number_of_can_channels(1);
   isobus::CANHardwareInterface::assign_can_channel_frame_handler(0, canDriver);
@@ -207,7 +281,12 @@ static void setupIsobus() {
   deviceName.set_industry_group(2);
   deviceName.set_device_class(0);
   deviceName.set_function_code(129);
-  deviceName.set_identity_number(1);
+  // A separate NAME per page mode: VTs store pools and AUX assignments by
+  // input unit NAME + input object ID (AgIsoVirtualTerminal ignores the
+  // model identification code). Sharing one NAME let a single-mode
+  // assignment (input 206) be restored onto the multi-page input set, where
+  // that input doesn't exist - and AgIsoVirtualTerminal hung.
+  deviceName.set_identity_number(settings_multi_page() ? 2 : 1);
   deviceName.set_ecu_instance(0);
   deviceName.set_function_instance(0);
   deviceName.set_device_class_instance(0);
@@ -235,17 +314,54 @@ static void setupIsobus() {
   // updates (per ISO 11783-6, a VT is allowed to skip re-uploading a pool
   // it already has cached under the same version string for this NAME) and
   // silently keep serving its old cached pool.
-  std::string poolVersion = isobus::IOPFileInterface::hash_object_pool_to_version(
-      AUX_N_POOL_DATA, AUX_N_POOL_SIZE);
-  vtClient->set_object_pool(0, AUX_N_POOL_DATA, AUX_N_POOL_SIZE, poolVersion);
-  vtClient->set_auxiliary_input_model_identification_code(1);
+  bool multiPage = settings_multi_page();
+  const uint8_t *poolData = multiPage ? AUX_N_POOL_MULTI_DATA : AUX_N_POOL_SINGLE_DATA;
+  uint32_t poolSize = multiPage ? AUX_N_POOL_MULTI_SIZE : AUX_N_POOL_SINGLE_SIZE;
+  std::string poolVersion =
+      isobus::IOPFileInterface::hash_object_pool_to_version(poolData, poolSize);
+  memcpy(poolBuffer, poolData, poolSize);
+  poolJustifyUpgrades = multiPage ? AUX_N_POOL_MULTI_JUSTIFY : AUX_N_POOL_SINGLE_JUSTIFY;
+  poolJustifyUpgradeCount =
+      multiPage ? AUX_N_POOL_MULTI_JUSTIFY_COUNT : AUX_N_POOL_SINGLE_JUSTIFY_COUNT;
+  vtClient->set_object_pool(0, poolBuffer, poolSize, poolVersion);
+  Serial.printf("[AUX-N] %s-page pool, %lu bytes\n", multiPage ? "multi" : "single",
+                (unsigned long)poolSize);
   for (uint8_t i = 0; i < NUM_AUX_ANALOG; i++) {
     vtClient->add_auxiliary_input_object_id(AUX_ANALOG_IDS[i]);
   }
-  for (uint8_t i = 0; i < NUM_AUX_BUTTONS; i++) {
-    vtClient->add_auxiliary_input_object_id(AUX_BUTTON_IDS[i]);
-  }
+  aux_buttons_setup(vtClient, internalECU, multiPage);
   vtClient->initialize(true);
+}
+
+// The pools ship with VT3-safe justification: vertical justification bits
+// are reserved on VT3 and older, and a VT3/Mueller unit rejected the pool
+// outright with them set (see JUSTIFY_HORIZONTAL_MASK in
+// tools/build_aux_pool.py). Once the connected VT reports version 4+, patch
+// the full justification back in. The version is known from the Get Memory
+// response, before the pool upload starts, so this always lands before any
+// of the patched bytes are sent.
+static void checkAndUpgradePoolJustification() {
+  if (poolJustificationChecked)
+    return;
+
+  auto vtVersion = vtClient->get_connected_vt_version();
+  if (isobus::VirtualTerminalClient::VTVersion::ReservedOrUnknown == vtVersion)
+    return; // not connected far enough yet to know the VT's version
+
+  poolJustificationChecked = true;
+
+  switch (vtVersion) {
+    case isobus::VirtualTerminalClient::VTVersion::Version4:
+    case isobus::VirtualTerminalClient::VTVersion::Version5:
+    case isobus::VirtualTerminalClient::VTVersion::Version6:
+      for (uint32_t i = 0; i < poolJustifyUpgradeCount; i++) {
+        poolBuffer[poolJustifyUpgrades[i].offset] = poolJustifyUpgrades[i].value;
+      }
+      Serial.println("[AUX-N] VT reports version 4+: upgraded justification");
+      break;
+    default:
+      break; // VT3 or older: keep the shipped VT3-safe justification
+  }
 }
 
 #if defined(ENABLE_OTA_WEBSERVER)
@@ -254,7 +370,9 @@ static WebServer otaServer(80);
 static void handleOtaRoot() {
   String html = "<html><body style='font-family:sans-serif'>"
                 "<h3>Joystick AUX-N</h3><p>ISOBUS AUX-N joystick firmware.</p>"
-                "<p><a href='/update'>Firmware update</a></p>"
+                "<p><a href='/wifi'>Wi-Fi setup</a> | "
+                "<a href='/debug'>Debug</a> | "
+                "<a href='/update'>Firmware update</a></p>"
                 "<p>Analog: ";
   for (uint8_t i = 0; i < NUM_AUX_ANALOG; i++) {
     html += String(analogValues[i]) + " ";
@@ -267,19 +385,68 @@ static void handleOtaRoot() {
   otaServer.send(200, "text/html", html);
 }
 
-static void ota_setup() {
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP("joystick-auxn", "12345678");
-  IPAddress ip = WiFi.softAPIP();
-  Serial.printf("[OTA] AP started, IP: %s\n", ip.toString().c_str());
-
-  otaServer.on("/", HTTP_GET, handleOtaRoot);
-  otaServer.begin();
-  ESP2SOTA.begin(&otaServer);
-  Serial.println("[OTA] Web server started on port 80 (/update for firmware)");
+static const char *vtVersionName(isobus::VirtualTerminalClient::VTVersion version) {
+  switch (version) {
+    case isobus::VirtualTerminalClient::VTVersion::Version2OrOlder: return "2 or older";
+    case isobus::VirtualTerminalClient::VTVersion::Version3: return "3";
+    case isobus::VirtualTerminalClient::VTVersion::Version4: return "4";
+    case isobus::VirtualTerminalClient::VTVersion::Version5: return "5";
+    case isobus::VirtualTerminalClient::VTVersion::Version6: return "6";
+    default: return "unknown";
+  }
 }
 
-static void ota_loop() { otaServer.handleClient(); }
+// Plain text, so it reads the same in a browser and from curl.
+static void handleDebug() {
+  const uint32_t now = millis();
+  String out;
+  out.reserve(12000);
+  out += "Joystick AUX-N " + String(GIT_COMMIT_SHORT) + ", up " + String(now / 1000) +
+         " s, reset reason " + String((int)esp_reset_reason()) + "\n";
+  out += "heap free " + String(ESP.getFreeHeap()) + ", min " + String(ESP.getMinFreeHeap()) +
+         "\n\nISOBUS\n  address ";
+  out += internalECU->get_address_valid() ? String(internalECU->get_address()) : "not claimed";
+  out += ", VT " + String(vtClient->get_is_connected() ? "connected" : "not connected") +
+         " (version " + vtVersionName(vtClient->get_connected_vt_version()) + "), " +
+         (settings_multi_page() ? "multi" : "single") + "-page pool\n";
+  twai_status_info_t twai;
+  if (twai_get_status_info(&twai) == ESP_OK) {
+    static const char *stateNames[] = {"STOPPED", "RUNNING", "BUS_OFF", "RECOVERING"};
+    out += "  TWAI " + String(twai.state < 4 ? stateNames[twai.state] : "?") + ", tx_err " +
+           String(twai.tx_error_counter) + ", rx_err " + String(twai.rx_error_counter) +
+           ", bus_err " + String(twai.bus_error_count) + ", msgs_to_tx " +
+           String(twai.msgs_to_tx) + "\n";
+  }
+  out += "\n";
+  wifi_debug_status(out);
+#if defined(ENABLE_CANLINK_BRIDGE)
+  out += "\n";
+  canlink_bridge::debug_status(out);
+#endif
+  out += "\nLog (newest last)\n";
+  debug_log_dump(out);
+  otaServer.send(200, "text/plain; charset=utf-8", out);
+}
+
+static void ota_setup() {
+#if defined(ENABLE_CANLINK_BRIDGE)
+  wifi_setup(otaServer, canlink_bridge::wifi_settings());
+#else
+  wifi_setup(otaServer, {"joystick-auxn", "joystick-auxn", "12345678",
+                         IPAddress(192, 168, 4, 1), 1});
+#endif
+
+  otaServer.on("/", HTTP_GET, handleOtaRoot);
+  otaServer.on("/debug", HTTP_GET, handleDebug);
+  otaServer.begin();
+  ESP2SOTA.begin(&otaServer);
+  debug_log("[OTA] Web server started on port 80 (/debug, /update)");
+}
+
+static void ota_loop() {
+  otaServer.handleClient();
+  wifi_update();
+}
 #endif
 
 void setup() {
@@ -289,6 +456,9 @@ void setup() {
     delay(10);
 
   Serial.println("\n=== Joystick AUX-N (ISOBUS Auxiliary Control Type 2) ===");
+  // esp_reset_reason_t: 1 power-on, 3 software, 4 panic/exception,
+  // 5-7 watchdogs, 9 brownout - tells a crash apart from a RESET press.
+  debug_log("Commit: %s  Reset reason: %d", GIT_COMMIT_SHORT, (int)esp_reset_reason());
 
   pinMode(LED1_PIN, OUTPUT);
   pinMode(LED2_PIN, OUTPUT);
@@ -305,15 +475,24 @@ void setup() {
     }
   }
   ads.setGain(GAIN_ONE); // +/- 4.096V
+  // 860 SPS: each single-shot read blocks ~1.2 ms instead of ~8 ms at the
+  // default 128 SPS, so polling 4 channels no longer starves the CAN loop.
+  ads.setDataRate(RATE_ADS1115_860SPS);
   Serial.println("ADS1115 OK");
 
   detectExtenderPCA9555();
 
+  settings_load(); // the page mode picks the object pool
   setupIsobus();
   Serial.println("[AUX-N] ISOBUS stack started, claiming address...");
+  lights_setup(vtClient);
+  settings_setup(vtClient);
 
 #if defined(ENABLE_OTA_WEBSERVER)
-  ota_setup();
+  ota_setup(); // Wi-Fi + mDNS, which the bridge needs
+#endif
+#if defined(ENABLE_CANLINK_BRIDGE)
+  canlink_bridge::begin();
 #endif
 
   digitalWrite(LED1_PIN, LOW); // ready
@@ -344,6 +523,28 @@ static void printStatus() {
                 (unsigned long)twaiStatus.arb_lost_count,
                 (unsigned long)twaiStatus.bus_error_count,
                 (unsigned long)twaiStatus.msgs_to_tx);
+#if defined(ENABLE_CANLINK_BRIDGE)
+  canlink_bridge::print_status();
+#endif
+}
+
+static constexpr uint8_t CAN_UPDATES_PER_LOOP = 16;
+
+// The TWAI controller stops transmitting for good after bus-off unless the
+// application recovers it (ESP-IDF doesn't, and neither does TWAIPlugin).
+static void recoverFromBusOff() {
+  twai_status_info_t status;
+  if (twai_get_status_info(&status) != ESP_OK)
+    return;
+  if (status.state == TWAI_STATE_BUS_OFF) {
+    Serial.printf("[TWAI] bus-off (bus_err=%lu), recovering\n",
+                  (unsigned long)status.bus_error_count);
+    twai_initiate_recovery();
+  } else if (status.state == TWAI_STATE_STOPPED) {
+    // Recovery finished (128 x 11 recessive bits seen): restart.
+    twai_start();
+    Serial.println("[TWAI] recovered, restarted");
+  }
 }
 
 void loop() {
@@ -355,8 +556,18 @@ void loop() {
   // possible: CANHardwareInterface for RX/TX pumping and the network
   // manager (address claiming, ...), VirtualTerminalClient for its own
   // state machine (VT handshake, object pool upload, ...).
-  isobus::CANHardwareInterface::update();
+  // Each update() moves at most one received frame, so pump several times
+  // to keep up with bursts (e.g. TP flow control during the pool upload).
+  for (uint8_t i = 0; i < CAN_UPDATES_PER_LOOP; i++) {
+    isobus::CANHardwareInterface::update();
+  }
+  recoverFromBusOff();
   vtClient->update();
+  checkAndUpgradePoolJustification();
+  lights_update();
+  settings_update();
+  aux_buttons_update();
+  syncCommitOnConnect();
 
   uint32_t now = millis();
   if (now - lastPollTime >= POLL_INTERVAL_MS) {

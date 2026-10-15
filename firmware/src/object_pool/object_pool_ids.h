@@ -3,11 +3,68 @@
 
 #define WORKING_SET 0
 #define MAIN_MASK 1
-#define TEST_STRING 2
 #define TEST_FONT 3
 #define DESIGNATOR_FONT 4
+#define LIGHTS_MASK 5
+#define BTN_LIGHTS_MODE 12
+#define KEY_LIGHTS_TOGGLE 14
+#define KEY_LIGHTS_PAGE 15
+#define KEY_BACK 16
+#define STR_KEY_TOGGLE_STATE 25
+#define STR_LIGHTS_MODE 22
+#define INPUT_RED 40
+#define INPUT_GREEN 41
+#define INPUT_BLUE 42
+#define INPUT_BRIGHTNESS 43
+#define JOY_BUTTON_FILL_BASE 520
+#define STR_COMMIT 52
+#define COMMIT_TEXT_LENGTH 8
+// Bit n set = PCA9555 bit n is drawn on the main mask (has a fill object)
+#define JOY_BUTTONS_ON_SCREEN 0x3FFE
 #define NUM_AUX_ANALOG 4
 #define NUM_AUX_BUTTONS 16
 
 static const uint16_t AUX_ANALOG_IDS[NUM_AUX_ANALOG] = {100, 101, 102, 103};
 static const uint16_t AUX_BUTTON_IDS[NUM_AUX_BUTTONS] = {200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215};
+
+// Settings mask
+#define SETTINGS_MASK 60
+#define KEY_SETTINGS 62
+#define BTN_PAGE_MODE 64
+#define STR_PAGE_MODE 65
+#define BTN_RESTART 66
+#define STR_RESTART_HINT 68
+#define BTN_PAGE_COLOUR_BASE 70
+#define STR_PAGE_COLOUR_BASE 74
+#define BTN_PRESS_FLASH 78
+#define STR_PRESS_FLASH 79
+#define PAGE_MODE_TEXT_LENGTH 13
+#define RESTART_HINT_TEXT_LENGTH 24
+#define PAGE_COLOUR_TEXT_LENGTH 15
+#define PRESS_FLASH_TEXT_LENGTH 16
+
+// Single / multi-page mode
+#define MODEL_ID_SINGLE 1
+#define MODEL_ID_MULTI 2
+#define AUX_POINTER_BASE 800
+#define NUM_PAGES 4
+#define PAGED_LAYERS 5
+#define PAGE_IND_FILL_BASE 1000
+#define NUM_PAGED_BUTTONS 9
+// PCA9555 bits of the buttons that have per-page inputs in multi mode
+static const uint8_t PAGED_BUTTON_BITS[NUM_PAGED_BUTTONS] = {1, 9, 2, 8, 7, 3, 6, 5, 4};
+// Multi mode AUX input per paged button: pages 1..4, then "*" (which
+// reuses the button's single-mode ID from AUX_BUTTON_IDS)
+static const uint16_t PAGED_AUX_IDS[NUM_PAGED_BUTTONS][PAGED_LAYERS] = {
+    {604, 605, 606, 607, 201},
+    {636, 637, 638, 639, 209},
+    {608, 609, 610, 611, 202},
+    {632, 633, 634, 635, 208},
+    {628, 629, 630, 631, 207},
+    {612, 613, 614, 615, 203},
+    {624, 625, 626, 627, 206},
+    {620, 621, 622, 623, 205},
+    {616, 617, 618, 619, 204},
+};
+// PCA9555 bits of T1..T4, which select page 1..4 in multi mode
+static const uint8_t PAGE_SELECT_BITS[NUM_PAGES] = {13, 12, 11, 10};

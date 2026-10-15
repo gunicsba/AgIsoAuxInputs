@@ -35,9 +35,11 @@ One central **brain board** handles power, CAN and the ISOBUS stack. **Keypads**
 
 [hardware/schematic.pdf](hardware/schematic.pdf) covers both boards: pages 1-2 are the Handgrip keypad (titled "Joystick Front"), pages 3-7 the brain board.
 
+Both boards are also published as one open-source EasyEDA project on OSHWLab: [ESP32S3R8N8 CAN Board](https://oshwlab.com/gunicsba/esp32s3r8n8-can-board). Open it there to view or edit the design, or to order boards directly.
+
 ### Downloads
 
-Each [GitHub release](https://github.com/gunicsba/AgIsoAuxInputs/releases) has a separate ZIP per board and per enclosure (`AgIsoAuxInputs-<version>-board-brain.zip`, `...-enclosure-jh-d400x.zip`, ...), so you can download only what you need. Board ZIPs include the Gerbers, BOM, pick-and-place and schematic.
+Each [GitHub release](https://github.com/gunicsba/AgIsoAuxInputs/releases) has a separate ZIP per board and per enclosure (`AgIsoAuxInputs-<version>-board-brain.zip`, `...-enclosure-jh-d400x.zip`, ...), so you can download only what you need. Board ZIPs include the Gerbers, BOM, pick-and-place and schematic. Releases also carry the firmware images (see [Flash a release](#flash-a-release)).
 
 To publish a release, push a tag:
 
@@ -46,7 +48,7 @@ git tag v1.0.0
 git push origin v1.0.0
 ```
 
-[tools/package_release.py](tools/package_release.py) builds the same ZIPs locally into `dist/`.
+[tools/package_release.py](tools/package_release.py) builds the same ZIPs locally into `dist/`. After a `pio run` of each firmware env, [tools/package_firmware.py](tools/package_firmware.py) adds the firmware images there.
 
 ## Devices
 
@@ -56,8 +58,42 @@ Brain board + JH-D400X module + Handgrip keypad.
 
 - 4 ADS1115 channels are sent as analog AUX-N inputs (function type "analogue, maintains position"), labelled `A1`-`A4`.
 - 16 keypad PCA9555 pins are sent as momentary boolean AUX-N inputs. The bit number equals the silkscreen number next to each button; see the [Handgrip README](hardware/boards/handgrip/#buttons) for positions and labels.
+- The VT's main screen draws the handgrip's buttons and LEDs; a button turns green while pressed. The firmware's commit is shown at the bottom (a trailing `+` means it was built with uncommitted changes).
+- Addressable LEDs (WS2811/SK6805) on GPIO7 show the ISOBUS state: red while no VT is connected, green for 5 s after one connects. After that they follow the **Lights** page: the **LIGHT** soft key turns them on/off, the **LIGHTS** soft key opens the page with a mode button (Rainbow, Colour, White), R/G/B values (Colour mode) and a brightness percentage (Rainbow and White). Settings are kept across power cycles. Every button press briefly inverts the LEDs (black if lit, white if dark); this can be turned off on the Settings page.
+- The **SETUP** soft key opens the Settings page: page mode, page colours and the press flash.
+
+#### Single and multi-page mode
+
+Switch on the Settings page (**PAGES**), then press **RESTART**: the mode picks the object pool and AUX input set at boot.
+
+- **Single**: one AUX-N input per button, as listed above.
+- **Multi**: T1-T4 select page 1-4 (the active one is yellow on the VT, and the LEDs show that page's colour). Every other button has an input per page (`MC1`-`MC4`) plus `MC*` for all pages. A press goes to the current page's input if a function is assigned to it, otherwise to `MC*`. The small squares at the bottom of each button show which one is active: `-X--`, `XXXX` (`*`) or `----` (nothing assigned).
+
+The joystick learns what's assigned by reading the VT's assignment commands to the implement off the bus. The `*` inputs reuse the single-mode IDs, so an assignment made in single mode applies to all pages in multi mode. Each mode has its own NAME (identity number 1 / 2) and model identification code, so VTs keep separate pools and assignments.
+
+The main screen also has an AUX designator pointer per button, so the VT can draw the assigned function's icon in it. It's turned off for now (`SHOW_AUX_POINTERS` in `build_aux_pool.py`) while a hang in AgIsoVirtualTerminal's AUX-N build is investigated ([AgIsoVirtualTerminal#252](https://github.com/Open-Agriculture/AgIsoVirtualTerminal/issues/252)).
 
 The brain board's own PCA9555 and the optocoupler output are not used by this firmware yet.
+
+## Flash a release
+
+You don't need to install anything to flash a board. You need Chrome or Edge, a USB cable, and the files from the [latest release](https://github.com/gunicsba/AgIsoAuxInputs/releases/latest). Each firmware variant (see [Build & flash](#build--flash)) comes as two files:
+
+- `...-<variant>-full.bin` is for a blank board, or to start over. It holds the bootloader, partition table and app.
+- `...-<variant>-update.bin` is for a board that already runs `joystick_ota` or `joystick_canlink`, through its `/update` web page.
+
+Pick `joystick_canlink` if you're not sure. It has the web pages, Wi-Fi updates and the CANlink bridge.
+
+### Blank board, over USB
+
+1. Put the board into download mode: hold **BOOT**, tap **RST**, then release **BOOT**. Or hold **BOOT** while you plug in the USB cable. The board doesn't do this on its own.
+2. Open [espressif.github.io/esptool-js](https://espressif.github.io/esptool-js/), click **Connect** and pick the board's serial port. On Windows it's a USB serial device (`303A:1001`).
+3. Under **Flash Address**, keep `0x0` and choose the `-full.bin` file. Click **Program** and wait for it to finish.
+4. Press **RST** to start the new firmware. The board won't reboot itself after flashing.
+
+### Later updates, over Wi-Fi
+
+Connect to the board's access point (password `12345678`): `AgIsoCanLink` at `http://192.168.0.34/` for `joystick_canlink`, or `joystick-auxn` at `http://192.168.4.1/` for `joystick_ota`. If the board has joined your network, use its address there instead. Open `/update`, upload the `-update.bin` file, and the board restarts with it. `/debug` shows the commit it's running.
 
 ## Build & flash
 
@@ -69,11 +105,17 @@ pio run -e joystick -t upload
 pio device monitor
 ```
 
-`joystick_ota` builds the same firmware with a Wi-Fi access point for updates: SSID `joystick-auxn`, password `12345678`. Open `http://192.168.4.1/` for live input values and `/update` to upload a new firmware.
+`joystick_ota` builds the same firmware with a Wi-Fi access point for updates: SSID `joystick-auxn`, password `12345678`. Open `http://192.168.4.1/` for live input values and `/update` to upload a new firmware. On `/wifi` you can change the access point's SSID and password, join an existing network, and rename the board; on that network it is reachable as `http://joystick-auxn.local/` (or the name you gave it). The access point stays on either way.
+
+`joystick_canlink` is `joystick_ota` plus a Wi-Fi/CAN bridge that speaks the Proemion CANlink protocol on TCP port 30000, like a CANlink WiFi gateway. A CANlink client becomes the VT, so you can test the pool and aux assignment with nothing else on the CAN bus. An example is AgIsoVirtualTerminal with AgIsoStack's CANlink plugin. Real bus traffic is bridged too. Its access point is `AgIsoCanLink` at `192.168.0.34` (password `12345678`), and the web pages are at `http://192.168.0.34/`. On a joined network the bridge is `joystick-auxn.local:30000`, announced as the mDNS service `_canlink._tcp`. The access point needs `192.168.0.34/24`, so don't join a network that also uses `192.168.0.x`.
+
+`/debug` shows the CAN, VT, Wi-Fi and bridge state plus the last ~8 KB of log lines, so a board can be diagnosed without USB. To flash over Wi-Fi from PlatformIO, run `pio run -e joystick_canlink -t ota` (or `-e joystick_ota`). It goes to `joystick-auxn.local` unless `--upload-port <host or IP>` names another.
+
+None of these pages, nor the bridge, ask for a login: anyone on the same network can flash firmware or send CAN frames.
 
 ### Changing the object pool
 
-Edit the labels or IDs in [firmware/tools/build_aux_pool.py](firmware/tools/build_aux_pool.py), then run it from `firmware/`:
+Edit the labels, IDs or screen layout in [firmware/tools/build_aux_pool.py](firmware/tools/build_aux_pool.py), then run it from `firmware/`:
 
 ```sh
 python tools/build_aux_pool.py
@@ -90,10 +132,22 @@ The ISOBUS NAME uses the placeholder manufacturer code `1407` (the one AgIsoStac
 - **Device profiles**: describe each device's inputs (source chip/pin, AUX-N function type, label) in one file per device. The object pool and the input mapping are generated from it, so a new keypad only needs a new profile.
 - Use the brain board's PCA9555 and skip unwired inputs.
 - Configurable NAME function instance, so several devices can share one bus.
-- Attach firmware binaries to releases.
 
 ## License
 
 [WTFPL](LICENSE). AgIsoStack++ is MIT licensed.
 
 HARDI and NOVA are trademarks of their respective owners. They are mentioned only to credit design inspiration; this project is not affiliated with or endorsed by HARDI.
+
+
+## Changes
+
+2026-09-13 - Added FASTLED driver to the brain and compatible LEDs to the joystick front 
+
+2026-09-13 - Parts shortage substitutions: brain board ideal diode controller is now an LM74700-Q1, handgrip LEDs are now SK6805D-EC2018
+
+2026-10-10 - Firmware: LED status and Lights page with soft keys, handgrip layout on the VT main screen with pressed-button highlight, AgIsoStack updated with CAN pacing and bus-off recovery
+
+2026-10-10 - Firmware: Settings page, single/multi-page AUX-N mode with per-page inputs, LED press flash and page colours, AUX designator pointers (hidden for now)
+
+2026-10-15 - Releases include ready-to-flash firmware images; a blank board can be flashed from the browser with esptool-js
