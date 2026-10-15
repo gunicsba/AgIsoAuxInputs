@@ -39,7 +39,7 @@ Both boards are also published as one open-source EasyEDA project on OSHWLab: [E
 
 ### Downloads
 
-Each [GitHub release](https://github.com/gunicsba/AgIsoAuxInputs/releases) has a separate ZIP per board and per enclosure (`AgIsoAuxInputs-<version>-board-brain.zip`, `...-enclosure-jh-d400x.zip`, ...), so you can download only what you need. Board ZIPs include the Gerbers, BOM, pick-and-place and schematic.
+Each [GitHub release](https://github.com/gunicsba/AgIsoAuxInputs/releases) has a separate ZIP per board and per enclosure (`AgIsoAuxInputs-<version>-board-brain.zip`, `...-enclosure-jh-d400x.zip`, ...), so you can download only what you need. Board ZIPs include the Gerbers, BOM, pick-and-place and schematic. Releases also carry the firmware images (see [Flash a release](#flash-a-release)).
 
 To publish a release, push a tag:
 
@@ -48,7 +48,7 @@ git tag v1.0.0
 git push origin v1.0.0
 ```
 
-[tools/package_release.py](tools/package_release.py) builds the same ZIPs locally into `dist/`.
+[tools/package_release.py](tools/package_release.py) builds the same ZIPs locally into `dist/`. After a `pio run` of each firmware env, [tools/package_firmware.py](tools/package_firmware.py) adds the firmware images there.
 
 ## Devices
 
@@ -74,6 +74,26 @@ The joystick learns what's assigned by reading the VT's assignment commands to t
 The main screen also has an AUX designator pointer per button, so the VT can draw the assigned function's icon in it. It's turned off for now (`SHOW_AUX_POINTERS` in `build_aux_pool.py`) while a hang in AgIsoVirtualTerminal's AUX-N build is investigated ([AgIsoVirtualTerminal#252](https://github.com/Open-Agriculture/AgIsoVirtualTerminal/issues/252)).
 
 The brain board's own PCA9555 and the optocoupler output are not used by this firmware yet.
+
+## Flash a release
+
+You don't need to install anything to flash a board. You need Chrome or Edge, a USB cable, and the files from the [latest release](https://github.com/gunicsba/AgIsoAuxInputs/releases/latest). Each firmware variant (see [Build & flash](#build--flash)) comes as two files:
+
+- `...-<variant>-full.bin` is for a blank board, or to start over. It holds the bootloader, partition table and app.
+- `...-<variant>-update.bin` is for a board that already runs `joystick_ota` or `joystick_canlink`, through its `/update` web page.
+
+Pick `joystick_canlink` if you're not sure. It has the web pages, Wi-Fi updates and the CANlink bridge.
+
+### Blank board, over USB
+
+1. Put the board into download mode: hold **BOOT**, tap **RST**, then release **BOOT**. Or hold **BOOT** while you plug in the USB cable. The board doesn't do this on its own.
+2. Open [espressif.github.io/esptool-js](https://espressif.github.io/esptool-js/), click **Connect** and pick the board's serial port. On Windows it's a USB serial device (`303A:1001`).
+3. Under **Flash Address**, keep `0x0` and choose the `-full.bin` file. Click **Program** and wait for it to finish.
+4. Press **RST** to start the new firmware. The board won't reboot itself after flashing.
+
+### Later updates, over Wi-Fi
+
+Connect to the board's access point (password `12345678`): `AgIsoCanLink` at `http://192.168.0.34/` for `joystick_canlink`, or `joystick-auxn` at `http://192.168.4.1/` for `joystick_ota`. If the board has joined your network, use its address there instead. Open `/update`, upload the `-update.bin` file, and the board restarts with it. `/debug` shows the commit it's running.
 
 ## Build & flash
 
@@ -112,7 +132,6 @@ The ISOBUS NAME uses the placeholder manufacturer code `1407` (the one AgIsoStac
 - **Device profiles**: describe each device's inputs (source chip/pin, AUX-N function type, label) in one file per device. The object pool and the input mapping are generated from it, so a new keypad only needs a new profile.
 - Use the brain board's PCA9555 and skip unwired inputs.
 - Configurable NAME function instance, so several devices can share one bus.
-- Attach firmware binaries to releases.
 
 ## License
 
@@ -130,3 +149,5 @@ HARDI and NOVA are trademarks of their respective owners. They are mentioned onl
 2026-10-10 - Firmware: LED status and Lights page with soft keys, handgrip layout on the VT main screen with pressed-button highlight, AgIsoStack updated with CAN pacing and bus-off recovery
 
 2026-10-10 - Firmware: Settings page, single/multi-page AUX-N mode with per-page inputs, LED press flash and page colours, AUX designator pointers (hidden for now)
+
+2026-10-15 - Releases include ready-to-flash firmware images; a blank board can be flashed from the browser with esptool-js
