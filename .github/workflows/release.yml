@@ -3,9 +3,12 @@ name: Release
 # Push a tag like v1.0.0 to publish a GitHub release with one ZIP per board
 # and per enclosure (see tools/package_release.py), plus a full and an
 # update firmware image per PlatformIO env (see tools/package_firmware.py).
+# Pull requests run the same build and keep the files as a workflow
+# artifact instead of publishing a release.
 on:
   push:
     tags: ["v*"]
+  pull_request:
 
 permissions:
   contents: write
@@ -20,8 +23,18 @@ jobs:
         with:
           python-version: "3.12"
 
+      # The tag for a release; for a PR, the commit being built (the PR's
+      # ref name, like "2/merge", isn't usable in a file name).
+      - name: Pick version
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then
+            echo "VERSION=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          else
+            echo "VERSION=pr${{ github.event.number }}-$(git rev-parse --short=7 HEAD)" >> "$GITHUB_ENV"
+          fi
+
       - name: Package hardware
-        run: python tools/package_release.py "${GITHUB_REF_NAME}"
+        run: python tools/package_release.py "${VERSION}"
 
       - uses: actions/cache@v4
         with:
@@ -35,11 +48,18 @@ jobs:
         run: pio run -d firmware -e joystick -e joystick_ota -e joystick_canlink
 
       - name: Package firmware
-        run: python tools/package_firmware.py "${GITHUB_REF_NAME}"
+        run: python tools/package_firmware.py "${VERSION}"
 
       - uses: softprops/action-gh-release@v2
+        if: github.ref_type == 'tag'
         with:
           files: |
             dist/*.zip
             dist/*.bin
           generate_release_notes: true
+
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'pull_request'
+        with:
+          name: AgIsoAuxInputs-${{ env.VERSION }}
+          path: dist/*.bin
