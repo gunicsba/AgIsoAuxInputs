@@ -241,17 +241,94 @@ static void detectExtenderPCA9555() {
   Serial.println("WARNING: no extender PCA9555 found at 0x21-0x23");
 }
 
-// AgIsoStack reports VT version bytes 0-2 (VT2 and the pre-standard
-// versions) as "unknown", so take the raw byte from the VT's Get Memory
-// response instead.
+static void logVtHardware(const isobus::CANMessage &message) {
+  static int loggedFeatures = -1;
+  const uint8_t features = message.get_uint8_at(3);
+  if (features == loggedFeatures)
+    return;
+  loggedFeatures = features;
+  // ISO 11783-6 Get Hardware response, hardware features bits 0-7
+  static const char *const FEATURE_NAMES[] = {
+      "touchscreen",      "pointing device",   "multi-frequency audio", "adjustable volume",
+      "simultaneous soft keys", "simultaneous buttons", "drag",       "drag coordinates"};
+  String names;
+  for (uint8_t bit = 0; bit < 8; bit++) {
+    if (features & (1u << bit)) {
+      if (names.length())
+        names += ", ";
+      names += FEATURE_NAMES[bit];
+    }
+  }
+  debug_log("[AUX-N] VT hardware: graphic type %u, features 0x%02X (%s)",
+            (unsigned)message.get_uint8_at(2), (unsigned)features,
+            names.length() ? names.c_str() : "no touchscreen or pointing device");
+}
+
+// What the operator does on the VT, as the VT reports it - to tell a press
+// that never arrives from one the firmware ignores.
+static void logVtInputEvent(const isobus::CANMessage &message) {
+  constexpr uint8_t SOFT_KEY_ACTIVATION = 0x00;
+  constexpr uint8_t BUTTON_ACTIVATION = 0x01;
+  constexpr uint8_t POINTING_EVENT = 0x02;
+  constexpr uint8_t SELECT_INPUT_OBJECT = 0x03;
+  constexpr uint8_t ESC = 0x04;
+  constexpr uint8_t CHANGE_NUMERIC_VALUE = 0x05;
+  constexpr uint8_t STILL_HELD = 2;
+
+  switch (message.get_uint8_at(0)) {
+    case SOFT_KEY_ACTIVATION:
+    case BUTTON_ACTIVATION:
+      if (message.get_uint8_at(1) == STILL_HELD)
+        return; // repeats while held
+      debug_log("[VT-IN] %s %u: code %u (0 released, 1 pressed, 3 aborted), parent %u, key %u",
+                message.get_uint8_at(0) == SOFT_KEY_ACTIVATION ? "soft key" : "button",
+                (unsigned)message.get_uint16_at(2), (unsigned)message.get_uint8_at(1),
+                (unsigned)message.get_uint16_at(4), (unsigned)message.get_uint8_at(6));
+      break;
+    case POINTING_EVENT:
+      debug_log("[VT-IN] pointing event at %u,%u", (unsigned)message.get_uint16_at(1),
+                (unsigned)message.get_uint16_at(3));
+      break;
+    case SELECT_INPUT_OBJECT:
+      debug_log("[VT-IN] %s object %u",
+                message.get_uint8_at(3) == 0x01 ? "selected" : "deselected",
+                (unsigned)message.get_uint16_at(1));
+      break;
+    case ESC:
+      debug_log("[VT-IN] ESC on object %u", (unsigned)message.get_uint16_at(1));
+      break;
+    case CHANGE_NUMERIC_VALUE:
+      debug_log("[VT-IN] object %u changed to %lu", (unsigned)message.get_uint16_at(1),
+                (unsigned long)message.get_uint32_at(4));
+      break;
+    default:
+      break;
+  }
+}
+
+// Messages from the VT to us. AgIsoStack reports VT version bytes 0-2 (VT2
+// and the pre-standard versions) as "unknown", so take the raw byte from the
+// VT's Get Memory response instead; the rest is logged for diagnosis.
 static void onVtToEcuMessage(const isobus::CANMessage &message, void *) {
   constexpr uint8_t GET_MEMORY_RESPONSE = 0xC0;
-  if (message.get_data_length() < 2 || message.get_uint8_at(0) != GET_MEMORY_RESPONSE)
-    return;
-  uint8_t version = message.get_uint8_at(1);
-  if (version != vtVersionByte) {
-    vtVersionByte = version;
-    debug_log("[AUX-N] VT Get Memory response: version byte %u", (unsigned)version);
+  constexpr uint8_t GET_HARDWARE_RESPONSE = 0xC7;
+  if (message.get_data_length() < 8 || !internalECU->get_address_valid() ||
+      message.get_identifier().get_destination_address() != internalECU->get_address())
+    return; // also skips responses to other working sets on the same VT
+
+  switch (message.get_uint8_at(0)) {
+    case GET_MEMORY_RESPONSE:
+      if (message.get_uint8_at(1) != vtVersionByte) {
+        vtVersionByte = message.get_uint8_at(1);
+        debug_log("[AUX-N] VT Get Memory response: version byte %u", (unsigned)vtVersionByte);
+      }
+      break;
+    case GET_HARDWARE_RESPONSE:
+      logVtHardware(message);
+      break;
+    default:
+      logVtInputEvent(message);
+      break;
   }
 }
 
