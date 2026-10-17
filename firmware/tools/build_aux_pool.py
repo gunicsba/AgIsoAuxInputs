@@ -26,9 +26,9 @@ select a page; the other buttons have an input per page plus an all-pages
 
 Run this script (from firmware/) whenever object IDs/count/text need to change:
     python tools/build_aux_pool.py
-It (re)writes src/object_pool/aux_n_pool_{single,multi}.iop,
+It (re)writes src/object_pool/aux_n_pool_{single,multi}[_compact].iop,
 src/object_pool/object_pool_ids.h, src/object_pool/aux_n_pool_data.h and
-src/object_pool/aux_n_pool_justify.h.
+src/object_pool/aux_n_pool_justify.h and src/object_pool/aux_n_pool_vt2.h.
 """
 import pathlib
 import struct
@@ -47,6 +47,11 @@ WS_DESIGNATOR = 6
 MAIN_SOFT_KEY_MASK = 7
 LIGHTS_SOFT_KEY_MASK = 8
 KEY_FONT = 9
+# Data mask fonts. Scaled with the compact layout, unlike the designator and
+# soft key fonts (designators and soft keys keep their 60x32 on every VT).
+MASK_TITLE_FONT = 10        # 16x16 main title
+MASK_SMALL_FONT = 11        # 8x12 repo URL and commit
+PAGED_DESIGNATOR_FONT = 13  # 12x16 multi-page designators ("MC*")
 
 # Lights UI (see src/lights.cpp). Keys and buttons are reported by object ID
 # in VT Soft Key / Button Activation messages; the inputs carry their value
@@ -210,15 +215,30 @@ TYPE_OUTPUT_STRING = 11
 TYPE_FONT_ATTRIBUTES = 23
 TYPE_AUXILIARY_INPUT_TYPE_2 = 32
 TYPE_AUXILIARY_CONTROL_DESIGNATOR_TYPE_2 = 33
+TYPE_STRING_VARIABLE = 22
 
-# Designator box is a fixed 60x60, matching the CCI reference pool's sizing.
+# AUX-N (the type 2 AUX objects) arrived with VT version 3. A VT2 - e.g. the
+# AMATRON 3 that reports version byte 2 - rejects the pool at the first of
+# them ("Faulty Object 100", other error). The pool size is already sent by
+# the time the VT's version is known, so the firmware can't drop them;
+# instead it rewrites each one in place into a String Variable of the same
+# length (ID(2) type(1) length(2) value), which nothing references. Their
+# offsets go into aux_n_pool_vt2.h.
+VT3_OBJECT_TYPES = (TYPE_AUXILIARY_INPUT_TYPE_2, TYPE_AUXILIARY_CONTROL_DESIGNATOR_TYPE_2)
+STRING_VARIABLE_HEADER = 5
+
+# Everything drawn in a soft key designator - key labels, the working set
+# designator and the AUX input designators - is sized to 60x32, the smallest
+# soft key designator ISO 11783-6 allows a VT to have. A real VT checks it:
+# an AMATRON 3 (soft keys 60x47) rejected the whole pool on the first
+# AuxiliaryInputType2 while the designators were 60x60 ("Faulty Object 100",
+# other error). AgIsoVirtualTerminal draws them at any size.
 # FontSize::Size16x16 (16x16px/char) keeps the longest label ("X14"/"X15"/
-# "DL+"/"DL-"/"DR+"/"DR-", 3 chars = 48px wide) well clear of the 60px
-# edges - a bigger font would get clipped by the VT (objects/parts outside
-# the designator area are clipped per ISO 11783-6 Table J.4).
+# "DL+"/"DL-"/"DR+"/"DR-", 3 chars = 48px wide) inside the 60px width.
 DESIGNATOR_FONT_SIZE_ENUM = 4  # FontSize::Size16x16
 DESIGNATOR_CHAR_W = 16
-DESIGNATOR_BOX = 60
+DESIGNATOR_W = 60
+DESIGNATOR_H = 32
 # justification bitfield: bits0-1 horizontal (0=left, 1=middle, 2=right),
 # bits2-3 vertical (0=top, 1=middle). These are the values the UI is drawn
 # for, but vertical justification is a VT4+ feature: the bits are reserved on
@@ -240,6 +260,41 @@ COLOUR_BLACK = 0
 COLOUR_WHITE = 1
 COLOUR_SILVER = 7
 COLOUR_YELLOW = 14
+
+# --- Compact layout -----------------------------------------------------------
+# The data masks are drawn for 480x480. Each pool is also built as a compact
+# variant for a 200x200 mask (e.g. AMATRON 3): everything on the data masks
+# scaled by 200/480, fonts swapped for the largest VT font that fits the
+# scaled size. Only numbers change - every object keeps its length and
+# position in the pool - so the firmware can swap the compact pool in once
+# the VT reports its data mask size, and the offset-based VT2/VT4 patches
+# apply to both.
+LAYOUT_MASK_SIZE = 480
+COMPACT_MASK_SIZE = 200
+SCALE = 1.0   # set by build_pool()
+
+# ISO 11783-6 font size enum -> (width, height) in px
+FONT_SIZES = [(6, 8), (8, 8), (8, 12), (12, 16), (16, 16), (16, 24), (24, 32),
+              (32, 32), (32, 48), (48, 64), (64, 64), (64, 96), (96, 128),
+              (128, 128), (128, 192)]
+
+
+def pos(v: int) -> int:
+    """A data mask coordinate, scaled for the layout being built."""
+    return int(round(v * SCALE))
+
+
+def px(v: int) -> int:
+    """A data mask size, scaled, never below 1px."""
+    return max(1, pos(v))
+
+
+def scaled_font_size(size_enum: int) -> int:
+    w, h = FONT_SIZES[size_enum]
+    fits = [i for i, (fw, fh) in enumerate(FONT_SIZES)
+            if fw <= w * SCALE and fh <= h * SCALE]
+    return fits[-1] if fits else 0   # 6x8 is the smallest a VT has
+
 
 # Light page layout is drawn for a 480x480 data mask (AgIsoVirtualTerminal's
 # default); a VT with a smaller mask will clip the lower rows.
@@ -306,15 +361,20 @@ class PoolObject(bytes):
 
 
 class Pool(bytearray):
-    """Object pool that collects the absolute offsets of PoolObject upgrades."""
+    """Object pool that collects the absolute offsets of PoolObject upgrades
+    and of the AUX-N objects a VT2 doesn't know."""
 
     def __init__(self):
         super().__init__()
         self.justify_upgrades = []   # (offset within the pool, VT4 value)
+        self.vt3_objects = []        # (offset within the pool, object length)
 
     def __iadd__(self, obj):
         for offset, value in getattr(obj, "justify_upgrades", ()):
             self.justify_upgrades.append((len(self) + offset, value))
+        if obj[2] in VT3_OBJECT_TYPES:
+            assert len(obj) >= STRING_VARIABLE_HEADER, "too short to blank out"
+            self.vt3_objects.append((len(self), len(obj)))
         return super().__iadd__(obj)
 
 
@@ -361,7 +421,7 @@ def build_data_mask(object_id: int, soft_key_mask_id: int, children):
     data += u8(len(children))
     data += u8(0)                    # 0 macros
     for child_id, x, y in children:
-        data += u16(child_id) + i16(x) + i16(y)
+        data += u16(child_id) + i16(pos(x)) + i16(pos(y))
     return data
 
 
@@ -391,16 +451,22 @@ def build_key(object_id: int, children):
 
 
 def build_key_label(object_id: int, height: int, font_id: int, text: bytes):
-    return build_output_string(object_id, DESIGNATOR_BOX, height, font_id,
+    return build_output_string(object_id, DESIGNATOR_W, height, font_id,
                                 COLOUR_SILVER, text, justify=JUSTIFY_CENTERED,
-                                transparent=True)
+                                transparent=True, fixed_size=True)
+
+
+def build_designator(object_id: int, font_id: int, bg_colour: int, text: bytes):
+    return build_output_string(object_id, DESIGNATOR_W, DESIGNATOR_H, font_id,
+                                bg_colour, text, justify=JUSTIFY_CENTERED,
+                                fixed_size=True)
 
 
 def build_line_attributes(object_id: int, colour: int, width: int):
     # ID(2) type(1) colour(1) width(1) lineArt(2) nMacros(1) = 8 bytes
     data = u16(object_id) + u8(TYPE_LINE_ATTRIBUTES)
     data += u8(colour)
-    data += u8(width)
+    data += u8(px(width))
     data += u16(0xFFFF)              # solid line
     data += u8(0)                    # 0 macros
     return data
@@ -422,8 +488,8 @@ def build_output_rectangle(object_id: int, line_id: int, width: int, height: int
     # fillAttr(2) nMacros(1) = 13 bytes. No fill attributes = outline only.
     data = u16(object_id) + u8(TYPE_OUTPUT_RECTANGLE)
     data += u16(line_id)
-    data += u16(width)
-    data += u16(height)
+    data += u16(px(width))
+    data += u16(px(height))
     data += u8(0)                    # draw all four sides
     data += u16(fill_id)
     data += u8(0)                    # 0 macros
@@ -435,8 +501,8 @@ def build_button(object_id: int, label_id: int):
     # options(1) nChildren(1) nMacros(1) = 13 bytes, then (objectID, x, y)
     # per child. Options 0 = momentary, VT-drawn border, enabled.
     data = u16(object_id) + u8(TYPE_BUTTON)
-    data += u16(BUTTON_W)
-    data += u16(BUTTON_H)
+    data += u16(px(BUTTON_W))
+    data += u16(px(BUTTON_H))
     data += u8(COLOUR_SILVER)        # background colour
     data += u8(COLOUR_BLACK)         # border colour
     data += u8(object_id & 0xFF)     # key code (unused - firmware matches on object ID)
@@ -444,7 +510,7 @@ def build_button(object_id: int, label_id: int):
     data += u8(1)                    # 1 child: the label string
     data += u8(0)                    # 0 macros
     # Label fills the button face minus a 5px margin for the VT's border.
-    data += u16(label_id) + i16(5) + i16(5)
+    data += u16(label_id) + i16(pos(5)) + i16(pos(5))
     return data
 
 
@@ -459,8 +525,8 @@ def build_input_number(object_id: int, value: int, maximum: int):
     # value(4) min(4) max(4) offset(4) scale(float 4) decimals(1) format(1)
     # justify(1) options2(1) nMacros(1) = 38 bytes
     data = u16(object_id) + u8(TYPE_INPUT_NUMBER)
-    data += u16(INPUT_W)
-    data += u16(INPUT_H)
+    data += u16(px(INPUT_W))
+    data += u16(px(INPUT_H))
     data += u8(COLOUR_YELLOW)        # background colour: marks it editable
     data += u16(TEST_FONT)           # font attributes object
     data += u8(0)                    # options
@@ -480,11 +546,12 @@ def build_input_number(object_id: int, value: int, maximum: int):
 
 def build_output_string(object_id: int, width: int, height: int, font_id: int,
                          bg_colour: int, text: bytes, justify: int = 0,
-                         transparent: bool = False):
+                         transparent: bool = False, fixed_size: bool = False):
     # header: ID(2) type(1) width(2) height(2) bg(1) font(2) options(1) varRef(2) justify(1) strLen(2) = 16 bytes
+    # fixed_size: drawn in a soft key designator, not on a data mask.
     data = u16(object_id) + u8(TYPE_OUTPUT_STRING)
-    data += u16(width)
-    data += u16(height)
+    data += u16(width if fixed_size else px(width))
+    data += u16(height if fixed_size else px(height))
     data += u8(bg_colour)
     data += u16(font_id)             # font attributes object
     data += u8(1 if transparent else 0)  # options bit 0: transparent
@@ -496,11 +563,12 @@ def build_output_string(object_id: int, width: int, height: int, font_id: int,
     return with_justify(data, OUTPUT_STRING_JUSTIFY_OFFSET, justify)
 
 
-def build_font_attributes(object_id: int, size_enum: int):
+def build_font_attributes(object_id: int, size_enum: int, fixed_size: bool = False):
     # header: ID(2) type(1) colour(1) size(1) type(1) style(1) nMacros(1) = 8 bytes
+    # fixed_size: used in soft key designators, not on a data mask.
     data = u16(object_id) + u8(TYPE_FONT_ATTRIBUTES)
     data += u8(0)          # colour (black)
-    data += u8(size_enum)
+    data += u8(size_enum if fixed_size else scaled_font_size(size_enum))
     data += u8(0)           # FontType::ISO8859_1
     data += u8(0)           # style bitfield: none
     data += u8(0)           # 0 macros
@@ -549,7 +617,9 @@ def paged_label(label: str, layer: int):
     return label + ("*" if layer == NUM_PAGES else str(layer + 1))
 
 
-def build_pool(multi: bool):
+def build_pool(multi: bool, mask_size: int = LAYOUT_MASK_SIZE):
+    global SCALE
+    SCALE = mask_size / LAYOUT_MASK_SIZE
     pool = Pool()
     pool += build_working_set()
     main_children = [
@@ -612,15 +682,16 @@ def build_pool(multi: bool):
                                 [KEY_LIGHTS_TOGGLE, KEY_BACK])
     pool += build_soft_key_mask(SETTINGS_SOFT_KEY_MASK, [KEY_BACK])
     pool += build_font_attributes(TEST_FONT, LABEL_FONT_SIZE_ENUM)
-    pool += build_font_attributes(DESIGNATOR_FONT, DESIGNATOR_FONT_SIZE_ENUM)
-    pool += build_output_string(WS_DESIGNATOR, DESIGNATOR_BOX, DESIGNATOR_BOX,
-                                 DESIGNATOR_FONT, COLOUR_WHITE, b"JOY",
-                                 justify=JUSTIFY_CENTERED)
+    pool += build_font_attributes(DESIGNATOR_FONT, DESIGNATOR_FONT_SIZE_ENUM,
+                                  fixed_size=True)
+    pool += build_font_attributes(MASK_TITLE_FONT, DESIGNATOR_FONT_SIZE_ENUM)
+    pool += build_font_attributes(MASK_SMALL_FONT, KEY_FONT_SIZE_ENUM)
+    pool += build_font_attributes(PAGED_DESIGNATOR_FONT, LABEL_FONT_SIZE_ENUM,
+                                  fixed_size=True)
+    pool += build_designator(WS_DESIGNATOR, DESIGNATOR_FONT, COLOUR_WHITE, b"JOY")
 
     for oid, did, label in zip(AUX_ANALOG_IDS, DESIGNATOR_ANALOG_IDS, ANALOG_LABELS):
-        pool += build_output_string(did, DESIGNATOR_BOX, DESIGNATOR_BOX,
-                                     DESIGNATOR_FONT, 1, label.encode("ascii"),
-                                     justify=JUSTIFY_CENTERED)
+        pool += build_designator(did, DESIGNATOR_FONT, 1, label.encode("ascii"))
         pool += build_aux_input_type2(oid, FUNCTION_TYPE_ANALOGUE_MAINTAINS_POSITION, did)
 
     # The single-mode inputs exist in both pools: in multi mode a paged
@@ -632,11 +703,10 @@ def build_pool(multi: bool):
     for oid, did, label in zip(AUX_BUTTON_IDS, DESIGNATOR_BUTTON_IDS, BUTTON_LABELS):
         if multi and label in PAGED_LABELS:
             label = paged_label(label, ALL_PAGES_LAYER)   # "MC*", "DL+*"
-            font = TEST_FONT   # 12x16: 4 chars = 48px fit the 60px box
+            font = PAGED_DESIGNATOR_FONT   # 12x16: 4 chars = 48px fit the 60px box
         else:
             font = DESIGNATOR_FONT
-        pool += build_output_string(did, DESIGNATOR_BOX, DESIGNATOR_BOX, font, 1,
-                                     label.encode("ascii"), justify=JUSTIFY_CENTERED)
+        pool += build_designator(did, font, 1, label.encode("ascii"))
         pool += build_aux_input_type2(oid, FUNCTION_TYPE_BOOLEAN_MOMENTARY, did)
     for label in JOY_BUTTON_CENTRES:
         if multi and label in PAGE_SELECT_LABELS:
@@ -649,10 +719,9 @@ def build_pool(multi: bool):
     if multi:
         for bit, label in zip(PAGED_BITS, PAGED_LABELS):
             for page in range(NUM_PAGES):
-                pool += build_output_string(
-                    paged_designator_id(bit, page), DESIGNATOR_BOX, DESIGNATOR_BOX,
-                    TEST_FONT, 1, paged_label(label, page).encode("ascii"),
-                    justify=JUSTIFY_CENTERED)
+                pool += build_designator(
+                    paged_designator_id(bit, page), PAGED_DESIGNATOR_FONT, 1,
+                    paged_label(label, page).encode("ascii"))
                 pool += build_aux_input_type2(paged_aux_id(bit, page),
                                               FUNCTION_TYPE_BOOLEAN_MOMENTARY,
                                               paged_designator_id(bit, page))
@@ -677,14 +746,14 @@ def build_pool(multi: bool):
     pool += build_output_string(STR_RESTART_HINT, 460, 24, TEST_FONT,
                                  COLOUR_WHITE, RESTART_HINT_TEXT)
     pool += build_key(KEY_SETTINGS, [(STR_KEY_SETTINGS, 0, 0)])
-    pool += build_key_label(STR_KEY_SETTINGS, DESIGNATOR_BOX, KEY_FONT, b"SETUP")
+    pool += build_key_label(STR_KEY_SETTINGS, DESIGNATOR_H, KEY_FONT, b"SETUP")
 
-    pool += build_output_string(STR_MAIN_TITLE, 480, 40, DESIGNATOR_FONT,
+    pool += build_output_string(STR_MAIN_TITLE, 480, 40, MASK_TITLE_FONT,
                                  COLOUR_WHITE, MAIN_TITLE_TEXT,
                                  justify=JUSTIFY_CENTERED)
-    pool += build_output_string(STR_REPO_URL, 330, 20, KEY_FONT, COLOUR_WHITE,
+    pool += build_output_string(STR_REPO_URL, 330, 20, MASK_SMALL_FONT, COLOUR_WHITE,
                                  REPO_URL_TEXT)
-    pool += build_output_string(STR_COMMIT, 80, 20, KEY_FONT, COLOUR_WHITE,
+    pool += build_output_string(STR_COMMIT, 80, 20, MASK_SMALL_FONT, COLOUR_WHITE,
                                  COMMIT_PLACEHOLDER,
                                  justify=JUSTIFY_RIGHT_MIDDLE)
 
@@ -707,18 +776,18 @@ def build_pool(multi: bool):
                                        JOY_LED_FILL_BASE + led)
 
     # Soft keys. The toggle key shows "LIGHT" over the current state.
-    pool += build_font_attributes(KEY_FONT, KEY_FONT_SIZE_ENUM)
+    pool += build_font_attributes(KEY_FONT, KEY_FONT_SIZE_ENUM, fixed_size=True)
     pool += build_key(KEY_LIGHTS_TOGGLE, [
-        (STR_KEY_TOGGLE_TITLE, 0, 6),
-        (STR_KEY_TOGGLE_STATE, 0, 26),
+        (STR_KEY_TOGGLE_TITLE, 0, 0),
+        (STR_KEY_TOGGLE_STATE, 0, DESIGNATOR_H - 16),
     ])
-    pool += build_key_label(STR_KEY_TOGGLE_TITLE, 16, KEY_FONT, b"LIGHT")
-    pool += build_key_label(STR_KEY_TOGGLE_STATE, 24, DESIGNATOR_FONT,
+    pool += build_key_label(STR_KEY_TOGGLE_TITLE, DESIGNATOR_H - 16, KEY_FONT, b"LIGHT")
+    pool += build_key_label(STR_KEY_TOGGLE_STATE, 16, DESIGNATOR_FONT,
                             TOGGLE_STATE_TEXT)
     pool += build_key(KEY_LIGHTS_PAGE, [(STR_KEY_PAGE, 0, 0)])
-    pool += build_key_label(STR_KEY_PAGE, DESIGNATOR_BOX, KEY_FONT, b"LIGHTS")
+    pool += build_key_label(STR_KEY_PAGE, DESIGNATOR_H, KEY_FONT, b"LIGHTS")
     pool += build_key(KEY_BACK, [(STR_KEY_BACK, 0, 0)])
-    pool += build_key_label(STR_KEY_BACK, DESIGNATOR_BOX, KEY_FONT, b"BACK")
+    pool += build_key_label(STR_KEY_BACK, DESIGNATOR_H, KEY_FONT, b"BACK")
 
     # Lights page
     pool += build_button(BTN_LIGHTS_MODE, STR_LIGHTS_MODE)
@@ -752,9 +821,19 @@ def c_array(name: str, pool: bytes):
 
 def main():
     pools = {"single": build_pool(multi=False), "multi": build_pool(multi=True)}
+    compact_pools = {name: build_pool(multi=(name == "multi"), mask_size=COMPACT_MASK_SIZE)
+                     for name in pools}
+    # The firmware swaps the compact pool in after the pool size went out,
+    # and patches both at the same offsets.
+    for name, pool in pools.items():
+        compact = compact_pools[name]
+        assert len(compact) == len(pool), name
+        assert compact.justify_upgrades == pool.justify_upgrades, name
+        assert compact.vt3_objects == pool.vt3_objects, name
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    for name, pool in pools.items():
+    for name, pool in [*pools.items(),
+                       *((f"{n}_compact", p) for n, p in compact_pools.items())]:
         iop_path = OUT_DIR / f"aux_n_pool_{name}.iop"
         iop_path.write_bytes(bytes(pool))
         print(f"Wrote {iop_path} ({len(pool)} bytes)")
@@ -846,6 +925,12 @@ def main():
         "",
         *c_array("AUX_N_POOL_SINGLE", pools["single"]),
         *c_array("AUX_N_POOL_MULTI", pools["multi"]),
+        "// Same pools laid out for a data mask of AUX_N_POOL_COMPACT_MASK_SIZE",
+        "// (same size and object offsets as above)",
+        f"#define AUX_N_POOL_COMPACT_MASK_SIZE {COMPACT_MASK_SIZE}",
+        f"#define AUX_N_POOL_LAYOUT_MASK_SIZE {LAYOUT_MASK_SIZE}",
+        *c_array("AUX_N_POOL_SINGLE_COMPACT", compact_pools["single"]),
+        *c_array("AUX_N_POOL_MULTI_COMPACT", compact_pools["multi"]),
     ]
     data_header_path.write_text("\n".join(data_lines), encoding="ascii")
 
@@ -882,9 +967,38 @@ def main():
         ]
     justify_header_path.write_text("\n".join(justify_lines), encoding="ascii")
 
+    vt2_header_path = OUT_DIR / "aux_n_pool_vt2.h"
+    vt2_lines = [
+        "// Auto-generated by tools/build_aux_pool.py - do not edit by hand.",
+        "// AUX-N (VT3+) objects, rewritten into String Variables for a VT2.",
+        "#pragma once",
+        "",
+        "#include <stdint.h>",
+        "",
+        f"#define AUX_POOL_TYPE_STRING_VARIABLE {TYPE_STRING_VARIABLE}",
+        f"#define AUX_POOL_STRING_VARIABLE_HEADER {STRING_VARIABLE_HEADER}",
+        "",
+        "struct AuxPoolVt3Object {",
+        "  uint16_t offset;",
+        "  uint16_t length;",
+        "};",
+        "",
+    ]
+    for name, pool in pools.items():
+        prefix = f"AUX_N_POOL_{name.upper()}_VT3_OBJECTS"
+        vt2_lines += [
+            f"static const uint32_t {prefix}_COUNT = {len(pool.vt3_objects)};",
+            f"static const AuxPoolVt3Object {prefix}[] = {{",
+            *[f"    {{{offset}, {length}}}," for offset, length in pool.vt3_objects],
+            "};",
+            "",
+        ]
+    vt2_header_path.write_text("\n".join(vt2_lines), encoding="ascii")
+
     print(f"Wrote {header_path}")
     print(f"Wrote {data_header_path}")
     print(f"Wrote {justify_header_path}")
+    print(f"Wrote {vt2_header_path}")
 
 
 if __name__ == "__main__":

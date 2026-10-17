@@ -39,6 +39,7 @@
 #include "lights.h"
 #include "object_pool/aux_n_pool_data.h"
 #include "object_pool/aux_n_pool_justify.h"
+#include "object_pool/aux_n_pool_vt2.h"
 #include "settings.h"
 #include "object_pool/object_pool_ids.h"
 #include "canlink_bridge.h"
@@ -133,7 +134,13 @@ static uint8_t poolBuffer[AUX_N_POOL_MULTI_SIZE > AUX_N_POOL_SINGLE_SIZE
                              : AUX_N_POOL_SINGLE_SIZE];
 static const AuxPoolJustifyUpgrade *poolJustifyUpgrades = nullptr;
 static uint32_t poolJustifyUpgradeCount = 0;
-static bool poolJustificationChecked = false;
+static const AuxPoolVt3Object *poolVt3Objects = nullptr;
+static uint32_t poolVt3ObjectCount = 0;
+static const uint8_t *poolCompactData = nullptr; // same pool, 200x200 layout
+static uint32_t poolSize = 0;
+static bool poolAdapted = false;
+// Raw version byte from the VT's Get Memory response, -1 until it arrives
+static int vtVersionByte = -1;
 
 static uint16_t analogValues[NUM_AUX_ANALOG] = {0};
 static bool buttonStates[NUM_AUX_BUTTONS] = {false}; // for the log / OTA page
@@ -234,6 +241,20 @@ static void detectExtenderPCA9555() {
   Serial.println("WARNING: no extender PCA9555 found at 0x21-0x23");
 }
 
+// AgIsoStack reports VT version bytes 0-2 (VT2 and the pre-standard
+// versions) as "unknown", so take the raw byte from the VT's Get Memory
+// response instead.
+static void onVtToEcuMessage(const isobus::CANMessage &message, void *) {
+  constexpr uint8_t GET_MEMORY_RESPONSE = 0xC0;
+  if (message.get_data_length() < 2 || message.get_uint8_at(0) != GET_MEMORY_RESPONSE)
+    return;
+  uint8_t version = message.get_uint8_at(1);
+  if (version != vtVersionByte) {
+    vtVersionByte = version;
+    debug_log("[AUX-N] VT Get Memory response: version byte %u", (unsigned)version);
+  }
+}
+
 static void setupIsobus() {
   // Silence the native ESP-IDF driver logs (ANSI colour codes that show up
   // as raw escape-code clutter in most serial monitors) - the TWAI/GPIO
@@ -309,6 +330,9 @@ static void setupIsobus() {
 
   vtClient =
       std::make_shared<isobus::VirtualTerminalClient>(partnerVT, internalECU);
+  isobus::CANNetworkManager::CANNetwork.add_any_control_function_parameter_group_number_callback(
+      static_cast<std::uint32_t>(isobus::CANLibParameterGroupNumber::VirtualTerminalToECU),
+      onVtToEcuMessage, nullptr);
   // Hash the actual pool content into the version string. A hardcoded
   // literal here would make the VT think nothing changed across firmware
   // updates (per ISO 11783-6, a VT is allowed to skip re-uploading a pool
@@ -316,13 +340,17 @@ static void setupIsobus() {
   // silently keep serving its old cached pool.
   bool multiPage = settings_multi_page();
   const uint8_t *poolData = multiPage ? AUX_N_POOL_MULTI_DATA : AUX_N_POOL_SINGLE_DATA;
-  uint32_t poolSize = multiPage ? AUX_N_POOL_MULTI_SIZE : AUX_N_POOL_SINGLE_SIZE;
+  poolSize = multiPage ? AUX_N_POOL_MULTI_SIZE : AUX_N_POOL_SINGLE_SIZE;
+  poolCompactData = multiPage ? AUX_N_POOL_MULTI_COMPACT_DATA : AUX_N_POOL_SINGLE_COMPACT_DATA;
   std::string poolVersion =
       isobus::IOPFileInterface::hash_object_pool_to_version(poolData, poolSize);
   memcpy(poolBuffer, poolData, poolSize);
   poolJustifyUpgrades = multiPage ? AUX_N_POOL_MULTI_JUSTIFY : AUX_N_POOL_SINGLE_JUSTIFY;
   poolJustifyUpgradeCount =
       multiPage ? AUX_N_POOL_MULTI_JUSTIFY_COUNT : AUX_N_POOL_SINGLE_JUSTIFY_COUNT;
+  poolVt3Objects = multiPage ? AUX_N_POOL_MULTI_VT3_OBJECTS : AUX_N_POOL_SINGLE_VT3_OBJECTS;
+  poolVt3ObjectCount =
+      multiPage ? AUX_N_POOL_MULTI_VT3_OBJECTS_COUNT : AUX_N_POOL_SINGLE_VT3_OBJECTS_COUNT;
   vtClient->set_object_pool(0, poolBuffer, poolSize, poolVersion);
   Serial.printf("[AUX-N] %s-page pool, %lu bytes\n", multiPage ? "multi" : "single",
                 (unsigned long)poolSize);
@@ -333,35 +361,88 @@ static void setupIsobus() {
   vtClient->initialize(true);
 }
 
-// The pools ship with VT3-safe justification: vertical justification bits
-// are reserved on VT3 and older, and a VT3/Mueller unit rejected the pool
-// outright with them set (see JUSTIFY_HORIZONTAL_MASK in
-// tools/build_aux_pool.py). Once the connected VT reports version 4+, patch
-// the full justification back in. The version is known from the Get Memory
-// response, before the pool upload starts, so this always lands before any
-// of the patched bytes are sent.
-static void checkAndUpgradePoolJustification() {
-  if (poolJustificationChecked)
-    return;
+// The pools are built for VT3 and a 480x480 data mask, with VT3-safe
+// justification, and adapted here once the VT's version (Get Memory
+// response) and data mask size (Get Hardware response) are known. Both
+// arrive before the VT client sends the pool's version label and starts the
+// upload, and this runs between processing received frames and the VT
+// client's update, so it always lands before either.
+// - Data mask under 480: swap in the compact (200x200) layout, which has the
+//   same size and object offsets, under its own version label.
+// - VT4+: vertical justification bits are reserved on VT3 and older, and a
+//   VT3/Mueller unit rejected the pool outright with them set (see
+//   JUSTIFY_HORIZONTAL_MASK in tools/build_aux_pool.py) - patch the full
+//   justification back in.
+// - VT2 or older: AUX-N objects don't exist yet, and an AMATRON 3 (version
+//   byte 2) rejected the pool at the first one. Blank them out into String
+//   Variables of the same length (see VT3_OBJECT_TYPES in the builder). The
+//   pool still loads, but the VT can't assign the inputs.
+static void adaptPoolToVt() {
+  uint16_t maskSize = vtClient->get_number_x_pixels();
+  if (poolAdapted || vtVersionByte < 0 || 0 == maskSize)
+    return; // not connected far enough yet to know the VT
+  poolAdapted = true;
 
-  auto vtVersion = vtClient->get_connected_vt_version();
-  if (isobus::VirtualTerminalClient::VTVersion::ReservedOrUnknown == vtVersion)
-    return; // not connected far enough yet to know the VT's version
-
-  poolJustificationChecked = true;
-
-  switch (vtVersion) {
-    case isobus::VirtualTerminalClient::VTVersion::Version4:
-    case isobus::VirtualTerminalClient::VTVersion::Version5:
-    case isobus::VirtualTerminalClient::VTVersion::Version6:
-      for (uint32_t i = 0; i < poolJustifyUpgradeCount; i++) {
-        poolBuffer[poolJustifyUpgrades[i].offset] = poolJustifyUpgrades[i].value;
-      }
-      Serial.println("[AUX-N] VT reports version 4+: upgraded justification");
-      break;
-    default:
-      break; // VT3 or older: keep the shipped VT3-safe justification
+  if (maskSize < AUX_N_POOL_LAYOUT_MASK_SIZE) {
+    memcpy(poolBuffer, poolCompactData, poolSize);
+    vtClient->set_object_pool(
+        0, poolBuffer, poolSize,
+        isobus::IOPFileInterface::hash_object_pool_to_version(poolCompactData, poolSize));
+    debug_log("[AUX-N] VT data mask %u: using the %ux%u layout", (unsigned)maskSize,
+              (unsigned)AUX_N_POOL_COMPACT_MASK_SIZE, (unsigned)AUX_N_POOL_COMPACT_MASK_SIZE);
   }
+
+  if (vtVersionByte >= 4 && vtVersionByte != 0xFF) {
+    for (uint32_t i = 0; i < poolJustifyUpgradeCount; i++) {
+      poolBuffer[poolJustifyUpgrades[i].offset] = poolJustifyUpgrades[i].value;
+    }
+    Serial.println("[AUX-N] VT reports version 4+: upgraded justification");
+  } else if (vtVersionByte < 3 || vtVersionByte == 0xFF) {
+    for (uint32_t i = 0; i < poolVt3ObjectCount; i++) {
+      uint8_t *object = &poolBuffer[poolVt3Objects[i].offset];
+      uint16_t valueLength = poolVt3Objects[i].length - AUX_POOL_STRING_VARIABLE_HEADER;
+      object[2] = AUX_POOL_TYPE_STRING_VARIABLE; // keeps its object ID
+      object[3] = valueLength & 0xFF;
+      object[4] = valueLength >> 8;
+      memset(&object[AUX_POOL_STRING_VARIABLE_HEADER], ' ', valueLength);
+    }
+    debug_log("[AUX-N] VT2 or older: AUX-N not supported, blanked %lu AUX-N objects",
+              (unsigned long)poolVt3ObjectCount);
+  }
+}
+
+static const char *vtVersionName(isobus::VirtualTerminalClient::VTVersion version) {
+  switch (version) {
+    case isobus::VirtualTerminalClient::VTVersion::Version2OrOlder: return "2 or older";
+    case isobus::VirtualTerminalClient::VTVersion::Version3: return "3";
+    case isobus::VirtualTerminalClient::VTVersion::Version4: return "4";
+    case isobus::VirtualTerminalClient::VTVersion::Version5: return "5";
+    case isobus::VirtualTerminalClient::VTVersion::Version6: return "6";
+    default: return "unknown";
+  }
+}
+
+// Logs what the VT reported about itself once it's known (before the pool
+// upload starts), and again only if it changes - a VT that keeps rejecting
+// the pool reconnects every few seconds. Pool objects that need to fit the
+// soft key designator (keys, AUX input designators) are checked against
+// these sizes by a real VT.
+static void logVtCapabilities() {
+  static uint32_t logged = 0;
+
+  uint8_t keyW = vtClient->get_softkey_x_axis_pixels();
+  uint8_t keyH = vtClient->get_softkey_y_axis_pixels();
+  uint16_t maskW = vtClient->get_number_x_pixels();
+  if (vtVersionByte < 0 || 0 == keyW || 0 == maskW)
+    return;
+  uint32_t current = ((uint32_t)vtVersionByte << 24) ^ ((uint32_t)keyW << 16) ^
+                     ((uint32_t)keyH << 8) ^ maskW;
+  if (current == logged)
+    return;
+  logged = current;
+  debug_log("[AUX-N] VT version byte %d, soft key designator %ux%u, data mask %ux%u",
+            vtVersionByte, (unsigned)keyW, (unsigned)keyH, (unsigned)maskW,
+            (unsigned)vtClient->get_number_y_pixels());
 }
 
 #if defined(ENABLE_OTA_WEBSERVER)
@@ -385,17 +466,6 @@ static void handleOtaRoot() {
   otaServer.send(200, "text/html", html);
 }
 
-static const char *vtVersionName(isobus::VirtualTerminalClient::VTVersion version) {
-  switch (version) {
-    case isobus::VirtualTerminalClient::VTVersion::Version2OrOlder: return "2 or older";
-    case isobus::VirtualTerminalClient::VTVersion::Version3: return "3";
-    case isobus::VirtualTerminalClient::VTVersion::Version4: return "4";
-    case isobus::VirtualTerminalClient::VTVersion::Version5: return "5";
-    case isobus::VirtualTerminalClient::VTVersion::Version6: return "6";
-    default: return "unknown";
-  }
-}
-
 // Plain text, so it reads the same in a browser and from curl.
 static void handleDebug() {
   const uint32_t now = millis();
@@ -407,7 +477,12 @@ static void handleDebug() {
          "\n\nISOBUS\n  address ";
   out += internalECU->get_address_valid() ? String(internalECU->get_address()) : "not claimed";
   out += ", VT " + String(vtClient->get_is_connected() ? "connected" : "not connected") +
-         " (version " + vtVersionName(vtClient->get_connected_vt_version()) + "), " +
+         " (version " + vtVersionName(vtClient->get_connected_vt_version()) + ", byte " +
+         String(vtVersionByte) + ", soft key " +
+         String(vtClient->get_softkey_x_axis_pixels()) + "x" +
+         String(vtClient->get_softkey_y_axis_pixels()) + ", data mask " +
+         String(vtClient->get_number_x_pixels()) + "x" +
+         String(vtClient->get_number_y_pixels()) + "), " +
          (settings_multi_page() ? "multi" : "single") + "-page pool\n";
   twai_status_info_t twai;
   if (twai_get_status_info(&twai) == ESP_OK) {
@@ -562,8 +637,9 @@ void loop() {
     isobus::CANHardwareInterface::update();
   }
   recoverFromBusOff();
+  adaptPoolToVt();
   vtClient->update();
-  checkAndUpgradePoolJustification();
+  logVtCapabilities();
   lights_update();
   settings_update();
   aux_buttons_update();
