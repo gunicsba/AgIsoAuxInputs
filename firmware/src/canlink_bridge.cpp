@@ -69,11 +69,18 @@ static constexpr UBaseType_t STACK_RX_QUEUE_LENGTH = 256;
 static constexpr size_t TCP_TX_BUFFER_SIZE = 2048;
 // A client that stops reading (zero TCP window) keeps its session: ISOBUS
 // recovers from lost frames by itself (VT status timeout, TP timeouts), while
-// a closed connection is fatal for a client that doesn't reconnect. Frames
-// that don't fit the CAN-to-TCP queue meanwhile are dropped, and after a
-// stall this long the backlog is discarded rather than delivered stale.
+// a closed connection is fatal for a client that doesn't reconnect.
+// Meanwhile the CAN-to-TCP queue is compacted to the newest frame per CAN ID
+// whenever it runs nearly full, and once more after a stall this long, so
+// the latest of every periodic message (our Working Set Maintenance, AUX-N
+// input status, ...) reaches the client as soon as it reads again. Throwing
+// the whole backlog away instead made AgIsoVT drop the working set after
+// stalls well under its 3 s maintenance timeout.
 static constexpr uint32_t TCP_STALL_LOG_MS = 500;
-static constexpr uint32_t TCP_STALE_BACKLOG_MS = 1000;
+static constexpr uint32_t TCP_STALE_BACKLOG_MS = 2000;
+static constexpr UBaseType_t TCP_QUEUE_COMPACT_SPACES = 64; // compact below this much room
+static constexpr uint32_t TCP_QUEUE_COMPACT_INTERVAL_MS = 50;
+static constexpr size_t STALL_HISTORY_LENGTH = 5;
 // Dead peer (e.g. phone left the AP without closing) detected after
 // idle + interval * count seconds. (Keepalive only probes an idle link; a
 // stalled one is left to the stall handling above.)
@@ -89,6 +96,15 @@ struct QueuedTcpFrame {
   uint32_t connectionGeneration;
   uint8_t length;
   uint8_t data[17];
+};
+
+struct StallRecord {
+  uint32_t startMs;
+  uint32_t durationMs;        // 0 while ongoing
+  int8_t rssiStart;           // station RSSI in dBm, 0 = not joined to a network
+  int8_t rssiEnd;
+  uint32_t queueDrops;        // frames that didn't fit the queue
+  uint32_t duplicatesDropped; // older frames superseded by a newer one of the same CAN ID
 };
 
 static QueueHandle_t tcpQueue = nullptr;     // CAN frames -> tablet
@@ -126,11 +142,19 @@ static size_t txSent = 0;
 // Client stalls (tcpTask only)
 static uint32_t stallStartMs = 0; // 0 = not stalled
 static uint32_t stallStartQueueDrops = 0;
+static uint32_t stallStartDuplicates = 0;
+static int8_t stallStartRssi = 0;
 static bool stallLogged = false;
-static bool discardBacklog = false;
+static bool compactBacklog = false;
+static uint32_t lastCompactMs = 0;
 static uint32_t stallCount = 0;
 static uint32_t longestStallMs = 0;
-static uint32_t staleFramesDiscarded = 0;
+static uint32_t duplicateFramesDropped = 0;
+static StallRecord stallHistory[STALL_HISTORY_LENGTH]; // ring, newest at stallCount - 1
+
+// Scratch space for compactTcpQueue()
+static QueuedTcpFrame compactFrames[TCP_QUEUE_LENGTH];
+static uint32_t compactIds[TCP_QUEUE_LENGTH];
 
 // Session bookkeeping for /debug (tcpTask only)
 static String tabletAddress;
@@ -271,7 +295,7 @@ static void closeTcpClient(const String &reason) {
   tcpBufferLength = 0;
   txLength = txSent = 0;
   stallStartMs = 0;
-  stallLogged = discardBacklog = false;
+  stallLogged = compactBacklog = false;
   lastCloseReason = reason;
   lastCloseMs = millis();
   debug_log("[BRIDGE] Tablet %s disconnected after %lu s (%lu frames out, %lu in): %s",
@@ -295,17 +319,75 @@ static bool appendToTx(const uint8_t *data, size_t length) {
   return true;
 }
 
+static int8_t stationRssi() {
+  return WiFi.status() == WL_CONNECTED ? (int8_t)WiFi.RSSI() : 0;
+}
+
+static String rssiText(int8_t rssi) {
+  return rssi != 0 ? String(rssi) + " dBm" : String("n/a");
+}
+
+static uint32_t queuedFrameId(const QueuedTcpFrame &frame) {
+  return ((uint32_t)frame.data[3] << 24) | ((uint32_t)frame.data[4] << 16) |
+         ((uint32_t)frame.data[5] << 8) | frame.data[6];
+}
+
+// Drops every queued frame that has a newer one with the same CAN ID behind
+// it, keeping the rest in order. Frames queued meanwhile by the CAN RX task or
+// the stack land behind the kept ones, so the order stays chronological.
+static void compactTcpQueue(uint32_t generation) {
+  lastCompactMs = millis();
+  const UBaseType_t waiting = uxQueueMessagesWaiting(tcpQueue);
+  size_t count = 0;
+  for (UBaseType_t i = 0; i < waiting; ++i) {
+    if (xQueueReceive(tcpQueue, &compactFrames[count], 0) != pdTRUE) break;
+    if (compactFrames[count].connectionGeneration == generation) ++count;
+  }
+
+  // Newest first: a frame is kept unless a newer one with its ID was kept.
+  size_t keptIds = 0;
+  uint32_t duplicates = 0;
+  for (size_t i = count; i-- > 0;) {
+    const uint32_t id = queuedFrameId(compactFrames[i]);
+    bool newerKept = false;
+    for (size_t k = 0; k < keptIds && !newerKept; ++k) newerKept = compactIds[k] == id;
+    if (newerKept) {
+      compactFrames[i].length = 0; // dropped
+      ++duplicates;
+    } else {
+      compactIds[keptIds++] = id;
+    }
+  }
+  // Back to the front of the queue, newest first, so the oldest ends up first.
+  for (size_t i = count; i-- > 0;) {
+    if (compactFrames[i].length != 0 &&
+        xQueueSendToFront(tcpQueue, &compactFrames[i], 0) != pdTRUE)
+      ++tcpQueueDropCount;
+  }
+  duplicateFramesDropped += duplicates;
+  if (duplicates)
+    debug_log("[BRIDGE] Tablet backlog: kept the newest frame of %u CAN IDs, dropped %lu "
+              "older ones", (unsigned)keptIds, (unsigned long)duplicates);
+}
+
 static void endStall() {
   const uint32_t stalledMs = millis() - stallStartMs;
-  stallStartMs = 0;
   if (stalledMs > longestStallMs) longestStallMs = stalledMs;
-  if (stalledMs >= TCP_STALE_BACKLOG_MS) discardBacklog = true;
+  if (stalledMs >= TCP_STALE_BACKLOG_MS) compactBacklog = true;
   if (stallLogged) {
     stallLogged = false;
-    debug_log("[BRIDGE] Tablet reading again after %lu ms (%lu frames dropped meanwhile)",
-              (unsigned long)stalledMs,
-              (unsigned long)(tcpQueueDropCount - stallStartQueueDrops));
+    const int8_t rssi = stationRssi();
+    const uint32_t queueDrops = tcpQueueDropCount - stallStartQueueDrops;
+    debug_log("[BRIDGE] Tablet reading again after %lu ms (%lu frames dropped meanwhile), "
+              "RSSI %s",
+              (unsigned long)stalledMs, (unsigned long)queueDrops, rssiText(rssi).c_str());
+    StallRecord &record = stallHistory[(stallCount - 1) % STALL_HISTORY_LENGTH];
+    record.durationMs = stalledMs;
+    record.rssiEnd = rssi;
+    record.queueDrops = queueDrops;
+    record.duplicatesDropped = duplicateFramesDropped - stallStartDuplicates;
   }
+  stallStartMs = 0;
 }
 
 // Sends as much of txBuffer as the socket takes, without blocking. False if
@@ -323,6 +405,8 @@ static bool flushTx() {
       if (stallStartMs == 0) {
         stallStartMs = millis() | 1; // never 0 while stalled
         stallStartQueueDrops = tcpQueueDropCount;
+        stallStartDuplicates = duplicateFramesDropped;
+        stallStartRssi = stationRssi();
       }
       return true; // retried on the next round
     }
@@ -343,25 +427,28 @@ static void sendQueuedFrames() {
   QueuedTcpFrame frame;
 
   if (txSent < txLength) {
-    // Still stalled: leave the frames queued; what doesn't fit is dropped by
-    // queueForTablet().
-    if (!stallLogged && millis() - stallStartMs >= TCP_STALL_LOG_MS) {
+    // Still stalled: leave the frames queued, compacted to the newest per CAN
+    // ID once they nearly fill the queue; what still doesn't fit is dropped
+    // by queueForTablet().
+    const uint32_t now = millis();
+    if (!stallLogged && now - stallStartMs >= TCP_STALL_LOG_MS) {
       stallLogged = true;
+      stallHistory[stallCount % STALL_HISTORY_LENGTH] = {stallStartMs, 0, stallStartRssi, 0, 0, 0};
       ++stallCount;
-      debug_log("[BRIDGE] Tablet %s stopped reading; keeping the session, dropping "
-                "frames until it resumes", tabletAddress.c_str());
+      debug_log("[BRIDGE] Tablet %s stopped reading (RSSI %s at stall start, %s now, %u bytes "
+                "unsent); keeping the session",
+                tabletAddress.c_str(), rssiText(stallStartRssi).c_str(),
+                rssiText(stationRssi()).c_str(), (unsigned)(txLength - txSent));
     }
+    if (uxQueueSpacesAvailable(tcpQueue) < TCP_QUEUE_COMPACT_SPACES &&
+        now - lastCompactMs >= TCP_QUEUE_COMPACT_INTERVAL_MS)
+      compactTcpQueue(generation);
     return;
   }
 
-  if (discardBacklog) {
-    discardBacklog = false;
-    uint32_t discarded = 0;
-    while (xQueueReceive(tcpQueue, &frame, 0) == pdTRUE) {
-      if (frame.connectionGeneration == generation) ++discarded;
-    }
-    staleFramesDiscarded += discarded;
-    if (discarded) debug_log("[BRIDGE] Discarded %lu stale frames", (unsigned long)discarded);
+  if (compactBacklog) {
+    compactBacklog = false;
+    compactTcpQueue(generation);
   }
 
   uint32_t frames = 0;
@@ -568,6 +655,45 @@ static void enableKeepalive(int socketFd) {
   setsockopt(socketFd, IPPROTO_TCP, TCP_KEEPCNT, &TCP_KEEPALIVE_COUNT, sizeof(int));
 }
 
+// A VT client only talks to a VT whose address claim it has seen, and the
+// VT only knows nodes whose claims reached it. Claims made before this
+// tablet connected (the joystick's at boot, a VT that was already running)
+// never crossed the bridge, so ask everyone to claim again: the tablet side,
+// the bus and our own stack. A global Request for Address Claim must be
+// answered by every control function; it's sent from the NULL address since
+// the bridge has none of its own. Repeated shortly after the connection
+// opens, in case the client isn't processing frames yet.
+static constexpr uint32_t CLAIM_REQUEST_DELAYS_MS[] = {0, 1000, 3000};
+static size_t claimRequestsSent = 0;
+
+static void requestAddressClaims() {
+  constexpr uint32_t REQUEST_PGN = 0xEA00;
+  constexpr uint32_t ADDRESS_CLAIM_PGN = 0xEE00;
+  constexpr uint8_t GLOBAL_ADDRESS = 0xFF;
+  constexpr uint8_t NULL_ADDRESS = 0xFE;
+  constexpr uint32_t PRIORITY = 6;
+  // PDU1: the destination is the PGN's low byte
+  const uint32_t canId = (PRIORITY << 26) | ((REQUEST_PGN | GLOBAL_ADDRESS) << 8) | NULL_ADDRESS;
+  const uint8_t data[3] = {(uint8_t)ADDRESS_CLAIM_PGN, (uint8_t)(ADDRESS_CLAIM_PGN >> 8),
+                           (uint8_t)(ADDRESS_CLAIM_PGN >> 16)};
+
+  queueForTablet(canId, data, sizeof(data));
+
+  isobus::CANMessageFrame frame = {};
+  frame.identifier = canId;
+  frame.isExtendedFrame = true;
+  frame.dataLength = sizeof(data);
+  memcpy(frame.data, data, sizeof(data));
+  queueForStack(frame);
+
+  twai_message_t message = {};
+  message.identifier = canId;
+  message.extd = 1;
+  message.data_length_code = sizeof(data);
+  memcpy(message.data, data, sizeof(data));
+  if (twai_transmit(&message, 0) != ESP_OK) ++busTxFailCount;
+}
+
 static void acceptTcpClient() {
   if (activeTcpGeneration != 0 && !tcpClient.connected()) closeTcpClient("peer disconnected");
   WiFiClient candidate = tcpServer.available();
@@ -592,12 +718,24 @@ static void acceptTcpClient() {
   sessionStartRxFrames = tabletRxCount;
   ++sessionCount;
   activeTcpGeneration = generation;
+  claimRequestsSent = 0;
   debug_log("[BRIDGE] Tablet connected: %s", tabletAddress.c_str());
+}
+
+static void sendScheduledClaimRequests() {
+  constexpr size_t COUNT = sizeof(CLAIM_REQUEST_DELAYS_MS) / sizeof(CLAIM_REQUEST_DELAYS_MS[0]);
+  if (activeTcpGeneration == 0 || claimRequestsSent >= COUNT ||
+      millis() - sessionStartMs < CLAIM_REQUEST_DELAYS_MS[claimRequestsSent])
+    return;
+  requestAddressClaims();
+  debug_log("[BRIDGE] Request for Address Claim %u/%u sent", (unsigned)++claimRequestsSent,
+            (unsigned)COUNT);
 }
 
 static void tcpTask(void *) {
   for (;;) {
     acceptTcpClient();
+    sendScheduledClaimRequests();
     handleTcpInput();
     sendQueuedFrames();
     vTaskDelay(1);
@@ -652,14 +790,33 @@ void debug_status(String &out) {
   out += "\n  frames: bus rx " + String(busRxCount) + ", tablet rx " + String(tabletRxCount) +
          ", tcp tx " + String(tcpTxFrameCount) + ", queued " +
          String(tcpQueue ? uxQueueMessagesWaiting(tcpQueue) : 0) + "\n";
-  out += "  drops: tcp queue " + String(tcpQueueDropCount) + ", stale after stall " +
-         String(staleFramesDiscarded) + ", stack queue " + String(stackQueueDropCount) +
+  out += "  drops: tcp queue " + String(tcpQueueDropCount) + ", older duplicates " +
+         String(duplicateFramesDropped) + ", stack queue " + String(stackQueueDropCount) +
          ", bus tx " + String(busTxFailCount) + ", tcp write errors " +
          String(tcpWriteErrorCount) + "\n";
   out += "  tablet stalls " + String(stallCount) + ", longest " + String(longestStallMs) +
          " ms";
   if (stallStartMs != 0) out += ", stalled now for " + String(now - stallStartMs) + " ms";
   out += "\n";
+  // Last stalls, newest first (only those of at least TCP_STALL_LOG_MS)
+  const uint32_t recorded = min(stallCount, (uint32_t)STALL_HISTORY_LENGTH);
+  for (uint32_t i = 0; i < recorded; ++i) {
+    const StallRecord &record = stallHistory[(stallCount - 1 - i) % STALL_HISTORY_LENGTH];
+    char line[160];
+    snprintf(line, sizeof(line), "    at %lu.%lu s: ", (unsigned long)(record.startMs / 1000),
+             (unsigned long)(record.startMs % 1000 / 100));
+    out += line;
+    if (record.durationMs == 0) {
+      out += "ongoing, RSSI " + rssiText(record.rssiStart) + " at start\n";
+      continue;
+    }
+    snprintf(line, sizeof(line),
+             "%lu ms, RSSI %s -> %s, %lu queue drops, %lu older duplicates dropped\n",
+             (unsigned long)record.durationMs, rssiText(record.rssiStart).c_str(),
+             rssiText(record.rssiEnd).c_str(), (unsigned long)record.queueDrops,
+             (unsigned long)record.duplicatesDropped);
+    out += line;
+  }
 }
 
 void print_status() {
