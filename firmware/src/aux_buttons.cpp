@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 
+#include "debug_log.h"
 #include "isobus/hardware_integration/can_hardware_interface.hpp"
 #include "lights.h"
 #include "object_pool/object_pool_ids.h"
@@ -21,10 +22,18 @@ static bool multi = false;
 
 // --- AUX-N input objects -----------------------------------------------------
 
+// ISO 11783-6 Table J.5, type 2 (non-latching Boolean): value 1 is 1 on the
+// press and 2 while held; value 2 counts presses (off -> not off) only.
+static constexpr uint8_t AUX_RELEASED = 0;
+static constexpr uint8_t AUX_PRESSED = 1;
+static constexpr uint8_t AUX_HELD = 2;
+static constexpr uint32_t AUX_HELD_AFTER_MS = 200;
+
 struct AuxInput {
   uint16_t objectId;
-  bool value;
+  uint8_t state;      // AUX_RELEASED / AUX_PRESSED / AUX_HELD
   uint16_t transitions;
+  uint32_t pressedAt; // millis()
 };
 // Multi mode: the paged inputs, then the single-mode inputs of the
 // non-paged bits (T1-T4, spares). Those exist only so a restored single-mode
@@ -34,15 +43,24 @@ static constexpr size_t MAX_INPUTS =
 static AuxInput inputs[MAX_INPUTS];
 static size_t inputCount = 0;
 
-static void sendInput(AuxInput &input, bool value, bool forceResync) {
-  if (value != input.value) {
-    input.value = value;
+// A held input is passed on every poll: the (patched) VT client repeats it
+// every 200 ms, since an implement takes a held input as released after
+// 300 ms without a status message (J.7.9).
+static void sendInput(AuxInput &input, bool pressed, bool forceResync) {
+  const uint32_t now = millis();
+  uint8_t state = AUX_RELEASED;
+  if (pressed && input.state == AUX_RELEASED) {
+    state = AUX_PRESSED;
+    input.pressedAt = now;
     input.transitions++;
-  } else if (!forceResync) {
-    return;
+  } else if (pressed) {
+    state = (now - input.pressedAt < AUX_HELD_AFTER_MS) ? AUX_PRESSED : AUX_HELD;
   }
-  vt->update_auxiliary_input(input.objectId, input.value ? 1 : 0,
-                             input.transitions);
+  const bool changed = state != input.state;
+  input.state = state;
+  if (!changed && !forceResync && state != AUX_HELD)
+    return;
+  vt->update_auxiliary_input(input.objectId, state, input.transitions);
 }
 
 // --- Assignment tracking -----------------------------------------------------
@@ -94,7 +112,7 @@ static void handleAssignmentCommand(uint8_t owner, const uint8_t *msg) {
   if (name == UINT64_MAX && functionType == 0x1F &&
       functionId == isobus::NULL_OBJECT_ID) {
     removeAssignments(owner, true, 0);
-    Serial.printf("[AUX-N] addr %u: all functions unassigned\n", owner);
+    debug_log("[AUX-N] VT -> addr %u: all functions unassigned", owner);
     return;
   }
   // A function has at most one input: drop its old assignment either way.
@@ -105,8 +123,8 @@ static void handleAssignmentCommand(uint8_t owner, const uint8_t *msg) {
     assignments[assignmentCount++] = {owner, functionId, inputId};
     assignmentsChanged = true;
   }
-  Serial.printf("[AUX-N] addr %u function %u -> input %u\n", owner, functionId,
-                inputId);
+  debug_log("[AUX-N] VT -> addr %u: function %u assigned to our input %u", owner, functionId,
+            inputId);
 }
 
 // Passive TP reassembly of VT -> implement sessions carrying the 14-byte
@@ -123,7 +141,45 @@ static constexpr uint8_t PF_TP_CM = 0xEC;
 static constexpr uint8_t PF_TP_DT = 0xEB;
 static constexpr uint8_t TP_CM_RTS = 16;
 static constexpr uint32_t PGN_VT_TO_ECU = 0xE600;
+static constexpr uint32_t PGN_ECU_TO_VT = 0xE700;
+static constexpr uint8_t PF_VT_TO_ECU = 0xE6;
+static constexpr uint8_t PF_ECU_TO_VT = 0xE7;
 static constexpr uint8_t VT_AUX_ASSIGNMENT_TYPE_2 = 0x24;
+static constexpr uint8_t VT_PREFERRED_ASSIGNMENT = 0x22;
+static constexpr uint8_t VT_AUX_INPUT_MAINTENANCE = 0x23;
+static constexpr uint8_t VT_AUX_INPUT_STATUS_ENABLE = 0x25;
+
+// The AUX-N handshake as seen on the bus, logged to /debug: an implement's
+// Preferred Assignment (J.7.7) and the VT's response (J.7.8) - the VT allows
+// no manual assignment to an implement's functions before a valid one -,
+// the VT enabling our inputs (J.7.11), and the other auxiliary input units
+// (J.7.10).
+struct PreferredSniff {
+  bool active;
+  uint8_t source;
+  uint16_t size;
+};
+static PreferredSniff preferredSniff[4];
+static uint8_t inputUnitStatus[256]; // last maintenance status per source, 0xFF = unseen
+
+static void logAuxHandshake(uint8_t pf, uint8_t da, uint8_t sa, const uint8_t *d) {
+  if (pf == PF_VT_TO_ECU && d[0] == VT_PREFERRED_ASSIGNMENT) {
+    debug_log("[AUX-N] VT -> addr %u: Preferred Assignment response, error 0x%02X "
+              "(1 input unit, 2 function ID, 4 input ID, 8 duplicate, 16 other), function %u",
+              da, d[1], (unsigned)(d[2] | (d[3] << 8)));
+  } else if (pf == PF_ECU_TO_VT && d[0] == VT_PREFERRED_ASSIGNMENT) {
+    debug_log("[AUX-N] addr %u -> VT: Preferred Assignment, %u input units", sa, d[1]);
+  } else if (pf == PF_VT_TO_ECU && d[0] == VT_AUX_INPUT_STATUS_ENABLE && ecu->get_address_valid() &&
+             da == ecu->get_address()) {
+    debug_log("[AUX-N] VT %s input %u", (d[3] & 1) ? "enables" : "disables",
+              (unsigned)(d[1] | (d[2] << 8)));
+  } else if (pf == PF_ECU_TO_VT && da == 0xFF && d[0] == VT_AUX_INPUT_MAINTENANCE &&
+             inputUnitStatus[sa] != d[3]) {
+    inputUnitStatus[sa] = d[3];
+    debug_log("[AUX-N] addr %u: auxiliary input unit, model %u, %s", sa,
+              (unsigned)(d[1] | (d[2] << 8)), d[3] == 1 ? "ready" : "initializing");
+  }
+}
 
 static void onFrame(const isobus::CANMessageFrame &frame) {
   if (!frame.isExtendedFrame || frame.dataLength != 8)
@@ -132,10 +188,21 @@ static void onFrame(const isobus::CANMessageFrame &frame) {
   uint8_t da = (frame.identifier >> 8) & 0xFF;
   uint8_t sa = frame.identifier & 0xFF;
   const uint8_t *d = frame.data;
+  logAuxHandshake(pf, da, sa, d);
 
   if (pf == PF_TP_CM && d[0] == TP_CM_RTS) {
     uint16_t size = d[1] | (d[2] << 8);
     uint32_t pgn = d[5] | (d[6] << 8) | ((uint32_t)d[7] << 16);
+    // A Preferred Assignment naming input units takes a TP session; only its
+    // first packet is needed (function code, number of input units).
+    if (pgn == PGN_ECU_TO_VT && size <= 255) {
+      for (auto &p : preferredSniff) {
+        if (!p.active || p.source == sa) {
+          p = {true, sa, size};
+          break;
+        }
+      }
+    }
     if (pgn != PGN_VT_TO_ECU || size != sizeof(TpSniff::data))
       return;
     TpSniff *slot = nullptr;
@@ -150,6 +217,14 @@ static void onFrame(const isobus::CANMessageFrame &frame) {
     if (slot)
       *slot = {true, sa, da, d[3], {}};
   } else if (pf == PF_TP_DT) {
+    for (auto &p : preferredSniff) {
+      if (p.active && p.source == sa && d[0] == 1) {
+        p.active = false;
+        if (d[1] == VT_PREFERRED_ASSIGNMENT)
+          debug_log("[AUX-N] addr %u -> VT: Preferred Assignment, %u input units (%u bytes)",
+                    sa, d[2], p.size);
+      }
+    }
     for (auto &s : sniff) {
       if (!s.active || s.source != sa || s.destination != da)
         continue;
@@ -239,23 +314,24 @@ void aux_buttons_setup(std::shared_ptr<isobus::VirtualTerminalClient> vtClient,
     uint16_t pagedBits = 0;
     for (uint8_t b = 0; b < NUM_PAGED_BUTTONS; b++) {
       for (uint8_t layer = 0; layer < PAGED_LAYERS; layer++)
-        inputs[inputCount++] = {PAGED_AUX_IDS[b][layer], false, 0};
+        inputs[inputCount++] = {PAGED_AUX_IDS[b][layer], AUX_RELEASED, 0, 0};
       effectiveLayer[PAGED_BUTTON_BITS[b]] = ALL_PAGES_LAYER;
       pagedBits |= 1u << PAGED_BUTTON_BITS[b];
     }
     for (uint8_t i = 0; i < NUM_AUX_BUTTONS; i++) {
       if (!(pagedBits & (1u << i)))
-        inputs[inputCount++] = {AUX_BUTTON_IDS[i], false, 0};
+        inputs[inputCount++] = {AUX_BUTTON_IDS[i], AUX_RELEASED, 0, 0};
     }
   } else {
     for (uint8_t i = 0; i < NUM_AUX_BUTTONS; i++)
-      inputs[inputCount++] = {AUX_BUTTON_IDS[i], false, 0};
+      inputs[inputCount++] = {AUX_BUTTON_IDS[i], AUX_RELEASED, 0, 0};
   }
   for (size_t i = 0; i < inputCount; i++)
     vt->add_auxiliary_input_object_id(inputs[i].objectId);
   vt->set_auxiliary_input_model_identification_code(multi ? MODEL_ID_MULTI
                                                           : MODEL_ID_SINGLE);
 
+  memset(inputUnitStatus, 0xFF, sizeof(inputUnitStatus));
   isobus::CANHardwareInterface::get_can_frame_received_event_dispatcher()
       .add_listener(onFrame);
 }
