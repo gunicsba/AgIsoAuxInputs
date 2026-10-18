@@ -19,7 +19,7 @@ Built on [AgIsoStack++](https://github.com/Open-Agriculture/AgIsoStack-plus-plus
 
 | Device | State |
 |---|---|
-| Joystick: 4 analog axes + 13 buttons | Working end-to-end on real hardware (ESP32-S3 + PCAN-USB + AgIsoVirtualTerminal): address claim, VT handshake, object pool upload and live aux input assignment |
+| Joystick: 4 analog axes + 13 buttons | Working end-to-end on real hardware (ESP32-S3 + PCAN-USB + AgIsoVirtualTerminal): address claim, VT handshake, object pool upload and live aux input assignment. The pool also loads on a Müller BASIC Terminal (VT3) and an Amazone AMATRON 3 (VT2, which has no AUX-N, so the inputs can't be assigned there) |
 | Other keypads, switch boxes, ... | Planned, same brain board |
 
 ## Hardware
@@ -57,6 +57,8 @@ Every pull request runs the same build. Its firmware images are attached to the 
 ### Joystick
 
 Brain board + JH-D400X module + Handgrip keypad.
+
+<p align="center"><img src="docs/muller_basic_terminal.png" alt="The joystick's main screen on a Müller BASIC Terminal" width="480"><br>The joystick's main screen on a Müller BASIC Terminal (Dammann), in multi-page mode with page 1 active</p>
 
 - 4 ADS1115 channels are sent as analog AUX-N inputs (function type "analogue, maintains position"), labelled `A1`-`A4`.
 - 16 keypad PCA9555 pins are sent as momentary boolean AUX-N inputs. The bit number equals the silkscreen number next to each button; see the [Handgrip README](hardware/boards/handgrip/#buttons) for positions and labels.
