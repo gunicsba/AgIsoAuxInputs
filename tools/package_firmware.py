@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Packages the built firmware of every PlatformIO env into two files each:
+Packages the released firmware build (joystick_canlink, the one with the web
+pages, Wi-Fi updates and the CANlink bridge) into two files:
 
     dist/AgIsoAuxInputs-<version>-<env>-full.bin    blank board, flash at 0x0
     dist/AgIsoAuxInputs-<version>-<env>-update.bin  the /update web page
@@ -10,7 +11,7 @@ a browser flasher (https://espressif.github.io/esptool-js/) can write it in
 one go without PlatformIO.
 
 Build first, then run from the repo root (needs `pip install "esptool>=5,<6"`):
-    pio run -d firmware -e joystick -e joystick_ota -e joystick_canlink
+    pio run -d firmware -e joystick_canlink
     python tools/package_firmware.py v1.0.0
 """
 import pathlib
@@ -22,7 +23,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 BUILD = ROOT / "firmware" / ".pio" / "build"
 DIST = ROOT / "dist"
 
-ENVS = ("joystick", "joystick_ota", "joystick_canlink")
+ENVS = ("joystick_canlink",)
 
 # Offsets from ESP-IDF's ESP32-S3 defaults and firmware/partitions.csv.
 # The OTA data points the board at app0, so a board that ran an OTA update

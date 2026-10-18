@@ -79,12 +79,10 @@ The brain board's own PCA9555 and the optocoupler output are not used by this fi
 
 ## Flash a release
 
-You don't need to install anything to flash a board. You need Chrome or Edge, a USB cable, and the files from the [latest release](https://github.com/gunicsba/AgIsoAuxInputs/releases/latest). Each firmware variant (see [Build & flash](#build--flash)) comes as two files:
+You don't need to install anything to flash a board. You need Chrome or Edge, a USB cable, and the files from the [latest release](https://github.com/gunicsba/AgIsoAuxInputs/releases/latest). Releases ship the `joystick_canlink` build (web pages, Wi-Fi updates and the CANlink bridge; see [Build & flash](#build--flash) for the others) as two files:
 
-- `...-<variant>-full.bin` is for a blank board, or to start over. It holds the bootloader, partition table and app.
-- `...-<variant>-update.bin` is for a board that already runs `joystick_ota` or `joystick_canlink`, through its `/update` web page.
-
-Pick `joystick_canlink` if you're not sure. It has the web pages, Wi-Fi updates and the CANlink bridge.
+- `...-joystick_canlink-full.bin` is for a blank board, or to start over. It holds the bootloader, partition table and app.
+- `...-joystick_canlink-update.bin` is for a board that already runs `joystick_ota` or `joystick_canlink`, through its `/update` web page.
 
 ### Blank board, over USB
 
