@@ -45,7 +45,7 @@ jobs:
         run: pip install platformio "esptool>=5,<6"
 
       - name: Build firmware
-        run: pio run -d firmware -e joystick -e joystick_ota -e joystick_canlink
+        run: pio run -d firmware -e joystick_canlink
 
       - name: Package firmware
         run: python tools/package_firmware.py "${VERSION}"

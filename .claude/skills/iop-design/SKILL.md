@@ -91,11 +91,31 @@ Hardware) before the pool is uploaded.
   (after runtime patching), never from a hard-coded string, or terminals keep
   serving a stale pool.
 
-### 8. AUX-N inputs
+### 8. AUX-N inputs (ISO 11783-6:2014 Annex J)
 - Keep input object IDs stable across firmware and modes. VTs restore saved
   assignments by NAME + input object ID, and AgIsoVirtualTerminal hangs when a
   restored assignment points at an input that no longer exists. Give input sets
   that differ their own NAME (identity number) and model identification code.
+- The VT allows no manual assignment to an implement's functions until that
+  implement sent a valid Preferred Assignment (J.5, J.6). An implement that
+  prefers your input unit waits for your Auxiliary Input Type 2 Maintenance
+  message with status Ready (J.7.7, J.7.10: every 100 ms, global, Ready only
+  after a successful End of Object Pool or Load Version response). A broken
+  maintenance message therefore blocks assignment for the implement too.
+- Declare the function type the hardware really is (Table J.5): the VT only
+  pairs an input with a function of exactly the same type. A spring-centred
+  joystick axis is type 3 ("return to 50%"), not type 1 ("maintains
+  position").
+- Status messages (J.7.9): none for an input until the VT enabled it (except
+  in learn mode). Object ID FFFF in a Status Enable command means all inputs,
+  disable only (J.7.11) - answering it with an error can make the VT drop the
+  input unit. Analog values are 0..0xFAFF; anything above is reserved, error
+  or not available. A momentary button reports 1 when pressed, then 2 while
+  held, repeated every 200 ms: an implement treats a held input as released
+  after 300 ms without one. Value 2 counts presses (off to not off) only.
+- AgIsoStack's VT client gets the status rules wrong; this repository patches
+  it at build time (`firmware/tools/patch_agisostack.py`). Recheck the patch
+  whenever the pinned AgIsoStack commit moves.
 
 ## Reading a rejection
 

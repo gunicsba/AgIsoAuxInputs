@@ -28,6 +28,7 @@
 #include "isobus/hardware_integration/twai_plugin.hpp"
 #include "isobus/isobus/can_internal_control_function.hpp"
 #include "isobus/isobus/can_network_manager.hpp"
+#include "isobus/isobus/can_parameter_group_number_request_protocol.hpp"
 #include "isobus/isobus/can_partnered_control_function.hpp"
 #include "isobus/isobus/can_stack_logger.hpp"
 #include "isobus/isobus/isobus_virtual_terminal_client.hpp"
@@ -186,9 +187,13 @@ static void pollInputsAndReport(bool forceResync) {
   // 4 ADS1115 channels -> analog AUX-N inputs (maintains-position pots)
   for (uint8_t ch = 0; ch < NUM_AUX_ANALOG; ch++) {
     int16_t raw = ads.readADC_SingleEnded(ch);
-    // ADS1115 single-ended reads are 0..~32767 at GAIN_ONE; scale to the
-    // full 16-bit range AUX-N analog inputs report.
-    uint16_t scaled = (uint16_t)constrain((int32_t)raw * 2, 0, 0xFFFF);
+    // ADS1115 single-ended reads are 0..~32767 at GAIN_ONE. AUX-N analog
+    // inputs report 0-100% as 0..0xFAFF (ISO 11783-6 Table J.5, J.7.9);
+    // above that are the reserved, error and not-available ranges.
+    constexpr uint32_t ADC_MAX = 32767;
+    constexpr uint32_t AUX_ANALOG_MAX = 0xFAFF;
+    uint16_t scaled = (uint16_t)((uint32_t)constrain(raw, (int16_t)0, (int16_t)ADC_MAX) *
+                                 AUX_ANALOG_MAX / ADC_MAX);
     uint16_t prev = analogValues[ch];
     if (forceResync || (uint16_t)abs((int32_t)scaled - (int32_t)prev) >
                             ANALOG_HYSTERESIS) {
@@ -338,6 +343,16 @@ static void onVtToEcuMessage(const isobus::CANMessage &message, void *) {
   }
 }
 
+// AgIsoStack answers a Request for Address Claim sent to us with our claim
+// (InternalControlFunction) and, as no PGN request callback handles PGN
+// 60928, also with a NACK. ISO 11783-5 expects only the claim; on an
+// AMATRON 3 bus something kept re-requesting. Mark it handled, without an ACK.
+static bool onAddressClaimRequest(std::uint32_t, std::shared_ptr<isobus::ControlFunction>,
+                                  bool &acknowledge, isobus::AcknowledgementType &, void *) {
+  acknowledge = false;
+  return true;
+}
+
 static void setupIsobus() {
   // Silence the native ESP-IDF driver logs (ANSI colour codes that show up
   // as raw escape-code clutter in most serial monitors) - the TWAI/GPIO
@@ -410,6 +425,11 @@ static void setupIsobus() {
   auto partnerVT =
       isobus::CANNetworkManager::CANNetwork
           .create_partnered_control_function(0, vtNameFilters);
+  if (auto requests = internalECU->get_pgn_request_protocol().lock()) {
+    requests->register_pgn_request_callback(
+        static_cast<std::uint32_t>(isobus::CANLibParameterGroupNumber::AddressClaim),
+        onAddressClaimRequest, nullptr);
+  }
 
   vtClient =
       std::make_shared<isobus::VirtualTerminalClient>(partnerVT, internalECU);

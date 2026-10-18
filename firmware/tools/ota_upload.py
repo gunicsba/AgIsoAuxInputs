@@ -51,6 +51,7 @@ def ota_upload(source, target, env):
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
 
     print(f"Uploading {len(firmware)} bytes to http://{host}/update ...")
+    started = time.time()
     try:
         with urllib.request.urlopen(request, timeout=UPLOAD_TIMEOUT_S) as response:
             reply = response.read().decode(errors="replace").strip()
@@ -80,7 +81,12 @@ def ota_upload(source, target, env):
         try:
             with urllib.request.urlopen(f"http://{host}/debug", timeout=3) as response:
                 status = response.readline().decode(errors="replace").strip()
-            if expected is None or f" {expected}," in status:
+            # The commit alone doesn't prove the update: a rebuild with the same
+            # uncommitted changes reports the same one. The uptime has to
+            # show a reboot since the upload started.
+            uptime = re.search(r", up (\d+) s,", status)
+            rebooted = uptime is not None and int(uptime.group(1)) <= time.time() - started
+            if rebooted and (expected is None or f" {expected}," in status):
                 print("Board is back: " + status)
                 return
         except (urllib.error.URLError, OSError):

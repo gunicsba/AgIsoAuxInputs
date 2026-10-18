@@ -19,7 +19,7 @@ Built on [AgIsoStack++](https://github.com/Open-Agriculture/AgIsoStack-plus-plus
 
 | Device | State |
 |---|---|
-| Joystick: 4 analog axes + 13 buttons | Working end-to-end on real hardware (ESP32-S3 + PCAN-USB + AgIsoVirtualTerminal): address claim, VT handshake, object pool upload and live aux input assignment |
+| Joystick: 4 analog axes + 13 buttons | Working end-to-end on real hardware (ESP32-S3 + PCAN-USB + AgIsoVirtualTerminal): address claim, VT handshake, object pool upload and live aux input assignment. The pool also loads on a Müller BASIC Terminal (VT3) and an Amazone AMATRON 3 (VT2, which has no AUX-N, so the inputs can't be assigned there) |
 | Other keypads, switch boxes, ... | Planned, same brain board |
 
 ## Hardware
@@ -58,6 +58,8 @@ Every pull request runs the same build. Its firmware images are attached to the 
 
 Brain board + JH-D400X module + Handgrip keypad.
 
+<p align="center"><img src="docs/muller_basic_terminal.png" alt="The joystick's main screen on a Müller BASIC Terminal" width="480"><br>The joystick's main screen on a Müller BASIC Terminal (Dammann), in multi-page mode with page 1 active</p>
+
 - 4 ADS1115 channels are sent as analog AUX-N inputs (function type "analogue, maintains position"), labelled `A1`-`A4`.
 - 16 keypad PCA9555 pins are sent as momentary boolean AUX-N inputs. The bit number equals the silkscreen number next to each button; see the [Handgrip README](hardware/boards/handgrip/#buttons) for positions and labels.
 - The VT's main screen draws the handgrip's buttons and LEDs; a button turns green while pressed. The firmware's commit is shown at the bottom (a trailing `+` means it was built with uncommitted changes).
@@ -79,12 +81,10 @@ The brain board's own PCA9555 and the optocoupler output are not used by this fi
 
 ## Flash a release
 
-You don't need to install anything to flash a board. You need Chrome or Edge, a USB cable, and the files from the [latest release](https://github.com/gunicsba/AgIsoAuxInputs/releases/latest). Each firmware variant (see [Build & flash](#build--flash)) comes as two files:
+You don't need to install anything to flash a board. You need Chrome or Edge, a USB cable, and the files from the [latest release](https://github.com/gunicsba/AgIsoAuxInputs/releases/latest). Releases ship the `joystick_canlink` build (web pages, Wi-Fi updates and the CANlink bridge; see [Build & flash](#build--flash) for the others) as two files:
 
-- `...-<variant>-full.bin` is for a blank board, or to start over. It holds the bootloader, partition table and app.
-- `...-<variant>-update.bin` is for a board that already runs `joystick_ota` or `joystick_canlink`, through its `/update` web page.
-
-Pick `joystick_canlink` if you're not sure. It has the web pages, Wi-Fi updates and the CANlink bridge.
+- `...-joystick_canlink-full.bin` is for a blank board, or to start over. It holds the bootloader, partition table and app.
+- `...-joystick_canlink-update.bin` is for a board that already runs `joystick_ota` or `joystick_canlink`, through its `/update` web page.
 
 ### Blank board, over USB
 
