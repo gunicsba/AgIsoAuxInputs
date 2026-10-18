@@ -38,8 +38,7 @@
 #include "debug_log.h"
 #include "lights.h"
 #include "object_pool/aux_n_pool_data.h"
-#include "object_pool/aux_n_pool_justify.h"
-#include "object_pool/aux_n_pool_vt2.h"
+#include "object_pool_adapt.h"
 #include "settings.h"
 #include "object_pool/object_pool_ids.h"
 #include "canlink_bridge.h"
@@ -127,18 +126,17 @@ static std::shared_ptr<isobus::VirtualTerminalClient> vtClient = nullptr;
 static std::shared_ptr<isobus::InternalControlFunction> internalECU = nullptr;
 
 // Mutable RAM copy of the selected pool: set_object_pool() reads from this
-// pointer lazily as the pool uploads, so the VT4 justification upgrade below
-// (once the connected VT's version is known) has to patch a writable buffer.
-static uint8_t poolBuffer[AUX_N_POOL_MULTI_SIZE > AUX_N_POOL_SINGLE_SIZE
-                             ? AUX_N_POOL_MULTI_SIZE
-                             : AUX_N_POOL_SINGLE_SIZE];
-static const AuxPoolJustifyUpgrade *poolJustifyUpgrades = nullptr;
-static uint32_t poolJustifyUpgradeCount = 0;
-static const AuxPoolVt3Object *poolVt3Objects = nullptr;
-static uint32_t poolVt3ObjectCount = 0;
-static const uint8_t *poolCompactData = nullptr; // same pool, 200x200 layout
-static uint32_t poolSize = 0;
+// pointer lazily as the pool uploads, so adaptPoolToVt() (once the connected
+// VT is known) has to patch a writable buffer.
+static uint8_t poolBuffer[AUX_N_POOL_MAX_SIZE];
+static bool poolMultiPage = false;
 static bool poolAdapted = false;
+// What the VT reported in the current connection handshake (0 = not yet).
+// AgIsoStack's getters still hold the previous VT's values until its own
+// responses arrive, so the pool is fitted from these instead.
+static uint16_t vtMaskSize = 0;
+static uint8_t vtKeyWidth = 0;
+static uint8_t vtKeyHeight = 0;
 // Raw version byte from the VT's Get Memory response, -1 until it arrives
 static int vtVersionByte = -1;
 
@@ -306,11 +304,15 @@ static void logVtInputEvent(const isobus::CANMessage &message) {
   }
 }
 
-// Messages from the VT to us. AgIsoStack reports VT version bytes 0-2 (VT2
-// and the pre-standard versions) as "unknown", so take the raw byte from the
-// VT's Get Memory response instead; the rest is logged for diagnosis.
+// Messages from the VT to us. The Get Memory response starts every
+// connection handshake: the pool is fitted again for whatever VT answers
+// (see adaptPoolToVt()), from the version and sizes of this handshake.
+// AgIsoStack reports VT version bytes 0-2 (VT2 and the pre-standard versions)
+// as "unknown", so the raw byte is taken here; the rest is logged for
+// diagnosis.
 static void onVtToEcuMessage(const isobus::CANMessage &message, void *) {
   constexpr uint8_t GET_MEMORY_RESPONSE = 0xC0;
+  constexpr uint8_t GET_NUMBER_OF_SOFT_KEYS_RESPONSE = 0xC2;
   constexpr uint8_t GET_HARDWARE_RESPONSE = 0xC7;
   if (message.get_data_length() < 8 || !internalECU->get_address_valid() ||
       message.get_identifier().get_destination_address() != internalECU->get_address())
@@ -318,12 +320,16 @@ static void onVtToEcuMessage(const isobus::CANMessage &message, void *) {
 
   switch (message.get_uint8_at(0)) {
     case GET_MEMORY_RESPONSE:
-      if (message.get_uint8_at(1) != vtVersionByte) {
-        vtVersionByte = message.get_uint8_at(1);
-        debug_log("[AUX-N] VT Get Memory response: version byte %u", (unsigned)vtVersionByte);
-      }
+      vtVersionByte = message.get_uint8_at(1);
+      vtMaskSize = vtKeyWidth = vtKeyHeight = 0;
+      poolAdapted = false;
+      break;
+    case GET_NUMBER_OF_SOFT_KEYS_RESPONSE:
+      vtKeyWidth = message.get_uint8_at(4);
+      vtKeyHeight = message.get_uint8_at(5);
       break;
     case GET_HARDWARE_RESPONSE:
+      vtMaskSize = message.get_uint16_at(4);
       logVtHardware(message);
       break;
     default:
@@ -415,22 +421,17 @@ static void setupIsobus() {
   // updates (per ISO 11783-6, a VT is allowed to skip re-uploading a pool
   // it already has cached under the same version string for this NAME) and
   // silently keep serving its old cached pool.
+  // Until the VT is known, the full layout as built; adaptPoolToVt()
+  // replaces it (same size) before the version label is sent.
   bool multiPage = settings_multi_page();
-  const uint8_t *poolData = multiPage ? AUX_N_POOL_MULTI_DATA : AUX_N_POOL_SINGLE_DATA;
-  poolSize = multiPage ? AUX_N_POOL_MULTI_SIZE : AUX_N_POOL_SINGLE_SIZE;
-  poolCompactData = multiPage ? AUX_N_POOL_MULTI_COMPACT_DATA : AUX_N_POOL_SINGLE_COMPACT_DATA;
-  std::string poolVersion =
-      isobus::IOPFileInterface::hash_object_pool_to_version(poolData, poolSize);
-  memcpy(poolBuffer, poolData, poolSize);
-  poolJustifyUpgrades = multiPage ? AUX_N_POOL_MULTI_JUSTIFY : AUX_N_POOL_SINGLE_JUSTIFY;
-  poolJustifyUpgradeCount =
-      multiPage ? AUX_N_POOL_MULTI_JUSTIFY_COUNT : AUX_N_POOL_SINGLE_JUSTIFY_COUNT;
-  poolVt3Objects = multiPage ? AUX_N_POOL_MULTI_VT3_OBJECTS : AUX_N_POOL_SINGLE_VT3_OBJECTS;
-  poolVt3ObjectCount =
-      multiPage ? AUX_N_POOL_MULTI_VT3_OBJECTS_COUNT : AUX_N_POOL_SINGLE_VT3_OBJECTS_COUNT;
-  vtClient->set_object_pool(0, poolBuffer, poolSize, poolVersion);
+  poolMultiPage = multiPage;
+  const AuxPoolLayout &layout = aux_pool_layout(multiPage, AUX_POOL_COMPACT_BELOW_MASK);
+  memcpy(poolBuffer, layout.data, layout.size);
+  vtClient->set_object_pool(
+      0, poolBuffer, layout.size,
+      isobus::IOPFileInterface::hash_object_pool_to_version(poolBuffer, layout.size));
   Serial.printf("[AUX-N] %s-page pool, %lu bytes\n", multiPage ? "multi" : "single",
-                (unsigned long)poolSize);
+                (unsigned long)layout.size);
   for (uint8_t i = 0; i < NUM_AUX_ANALOG; i++) {
     vtClient->add_auxiliary_input_object_id(AUX_ANALOG_IDS[i]);
   }
@@ -438,54 +439,36 @@ static void setupIsobus() {
   vtClient->initialize(true);
 }
 
-// The pools are built for VT3 and a 480x480 data mask, with VT3-safe
-// justification, and adapted here once the VT's version (Get Memory
-// response) and data mask size (Get Hardware response) are known. Both
-// arrive before the VT client sends the pool's version label and starts the
-// upload, and this runs between processing received frames and the VT
-// client's update, so it always lands before either.
-// - Data mask under 480: swap in the compact (200x200) layout, which has the
-//   same size and object offsets, under its own version label.
-// - VT4+: vertical justification bits are reserved on VT3 and older, and a
-//   VT3/Mueller unit rejected the pool outright with them set (see
-//   JUSTIFY_HORIZONTAL_MASK in tools/build_aux_pool.py) - patch the full
-//   justification back in.
-// - VT2 or older: AUX-N objects don't exist yet, and an AMATRON 3 (version
-//   byte 2) rejected the pool at the first one. Blank them out into String
-//   Variables of the same length (see VT3_OBJECT_TYPES in the builder). The
-//   pool still loads, but the VT can't assign the inputs.
+// Fits the pool to the connected VT (see object_pool_adapt.h) in every
+// connection handshake, once the VT's version (Get Memory response), soft
+// key size, fonts and data mask size (Get Hardware response, the last of
+// them) are known. All arrive before the VT client sends the pool's version
+// label and starts the upload, and this runs between processing received
+// frames and the VT client's update, so it always lands before either. The
+// version label is the hash of the adapted pool, so a VT keeps the version
+// that fits it - and a VT whose sizes changed gets a fresh upload.
 static void adaptPoolToVt() {
-  uint16_t maskSize = vtClient->get_number_x_pixels();
-  if (poolAdapted || vtVersionByte < 0 || 0 == maskSize)
-    return; // not connected far enough yet to know the VT
+  if (poolAdapted || vtVersionByte < 0 || 0 == vtMaskSize)
+    return; // not far enough into the handshake yet
   poolAdapted = true;
 
-  if (maskSize < AUX_N_POOL_LAYOUT_MASK_SIZE) {
-    memcpy(poolBuffer, poolCompactData, poolSize);
-    vtClient->set_object_pool(
-        0, poolBuffer, poolSize,
-        isobus::IOPFileInterface::hash_object_pool_to_version(poolCompactData, poolSize));
-    debug_log("[AUX-N] VT data mask %u: using the %ux%u layout", (unsigned)maskSize,
-              (unsigned)AUX_N_POOL_COMPACT_MASK_SIZE, (unsigned)AUX_N_POOL_COMPACT_MASK_SIZE);
+  debug_log("[AUX-N] VT version byte %d, soft key designator %ux%u, data mask %ux%u",
+            vtVersionByte, (unsigned)vtKeyWidth, (unsigned)vtKeyHeight,
+            (unsigned)vtMaskSize, (unsigned)vtMaskSize);
+  // Fonts come from the Get Text Font Data response, already parsed by
+  // AgIsoStack before the Get Hardware response that triggers this.
+  VtDisplay vt = {vtVersionByte, vtMaskSize, vtKeyWidth, vtKeyHeight,
+                  1}; // 6x8 always exists
+  for (uint8_t size = 1; size < 15; size++) {
+    if (vtClient->get_font_size_supported(
+            static_cast<isobus::VirtualTerminalClient::FontSize>(size)))
+      vt.fontsSupported |= 1u << size;
   }
-
-  if (vtVersionByte >= 4 && vtVersionByte != 0xFF) {
-    for (uint32_t i = 0; i < poolJustifyUpgradeCount; i++) {
-      poolBuffer[poolJustifyUpgrades[i].offset] = poolJustifyUpgrades[i].value;
-    }
-    Serial.println("[AUX-N] VT reports version 4+: upgraded justification");
-  } else if (vtVersionByte < 3 || vtVersionByte == 0xFF) {
-    for (uint32_t i = 0; i < poolVt3ObjectCount; i++) {
-      uint8_t *object = &poolBuffer[poolVt3Objects[i].offset];
-      uint16_t valueLength = poolVt3Objects[i].length - AUX_POOL_STRING_VARIABLE_HEADER;
-      object[2] = AUX_POOL_TYPE_STRING_VARIABLE; // keeps its object ID
-      object[3] = valueLength & 0xFF;
-      object[4] = valueLength >> 8;
-      memset(&object[AUX_POOL_STRING_VARIABLE_HEADER], ' ', valueLength);
-    }
-    debug_log("[AUX-N] VT2 or older: AUX-N not supported, blanked %lu AUX-N objects",
-              (unsigned long)poolVt3ObjectCount);
-  }
+  const AuxPoolLayout &layout = aux_pool_layout(poolMultiPage, vtMaskSize);
+  aux_pool_adapt(poolBuffer, layout, vt);
+  vtClient->set_object_pool(
+      0, poolBuffer, layout.size,
+      isobus::IOPFileInterface::hash_object_pool_to_version(poolBuffer, layout.size));
 }
 
 static const char *vtVersionName(isobus::VirtualTerminalClient::VTVersion version) {
@@ -497,29 +480,6 @@ static const char *vtVersionName(isobus::VirtualTerminalClient::VTVersion versio
     case isobus::VirtualTerminalClient::VTVersion::Version6: return "6";
     default: return "unknown";
   }
-}
-
-// Logs what the VT reported about itself once it's known (before the pool
-// upload starts), and again only if it changes - a VT that keeps rejecting
-// the pool reconnects every few seconds. Pool objects that need to fit the
-// soft key designator (keys, AUX input designators) are checked against
-// these sizes by a real VT.
-static void logVtCapabilities() {
-  static uint32_t logged = 0;
-
-  uint8_t keyW = vtClient->get_softkey_x_axis_pixels();
-  uint8_t keyH = vtClient->get_softkey_y_axis_pixels();
-  uint16_t maskW = vtClient->get_number_x_pixels();
-  if (vtVersionByte < 0 || 0 == keyW || 0 == maskW)
-    return;
-  uint32_t current = ((uint32_t)vtVersionByte << 24) ^ ((uint32_t)keyW << 16) ^
-                     ((uint32_t)keyH << 8) ^ maskW;
-  if (current == logged)
-    return;
-  logged = current;
-  debug_log("[AUX-N] VT version byte %d, soft key designator %ux%u, data mask %ux%u",
-            vtVersionByte, (unsigned)keyW, (unsigned)keyH, (unsigned)maskW,
-            (unsigned)vtClient->get_number_y_pixels());
 }
 
 #if defined(ENABLE_OTA_WEBSERVER)
@@ -716,7 +676,6 @@ void loop() {
   recoverFromBusOff();
   adaptPoolToVt();
   vtClient->update();
-  logVtCapabilities();
   lights_update();
   settings_update();
   aux_buttons_update();

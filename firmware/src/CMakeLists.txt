@@ -11,5 +11,5 @@
 # target_add_binary_data()/board_build.embed_files - both turned out to be
 # fragile (mis-pathed / silently not firing) under this mixed
 # arduino+espidf build, so the array is far simpler and just works.
-idf_component_register(SRCS "aux_buttons.cpp" "lights.cpp" "main.cpp" "settings.cpp" "debug_log.cpp" "canlink_bridge.cpp" "wifi_setup.cpp" INCLUDE_DIRS "."
+idf_component_register(SRCS "aux_buttons.cpp" "lights.cpp" "main.cpp" "settings.cpp" "debug_log.cpp" "canlink_bridge.cpp" "wifi_setup.cpp" "object_pool_adapt.cpp" INCLUDE_DIRS "."
                         REQUIRES framework-arduinoespressif32)
