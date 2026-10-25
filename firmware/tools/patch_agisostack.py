@@ -12,6 +12,9 @@ ISO 11783-6:2014 Annex J. Still needed on AgIsoStack main as of 2026-10.
 3. J.7.9: a held non-latched Boolean (value 1 = 2) repeats its status every
    200 ms; an implement treats it as released after 300 ms without one.
    AgIsoStack only sent changes (and once a second).
+4. Object pools uploaded in several parts: a failed part started the next
+   part's transfer, whose result was then lost, and the upload never
+   started again.
 
 Each patch is applied once per library copy (every env has its own under
 .pio/libdeps/<env>/); a patched copy is recognised by the new code. The build fails if the code to
@@ -87,6 +90,32 @@ PATCHES = [
 								}
 								result->second.enabled = shouldEnable;
 							}""",
+    ),
+    # Multi-part object pools (several set_object_pool() indexes): after a
+    # part failed, the upload loop went on and started the next part while
+    # resetting the connection. That session's result came outside
+    # UploadObjectPool and was dropped, so the upload state stayed
+    # "in progress" and every later connection waited for it forever.
+    (
+        "multi-part upload: stop after a failed part",
+        "\t\t\t\t\t\t\t\tLOG_ERROR(\"[VT]: An object pool failed to upload. Resetting connection to VT.\");\n"
+        "\t\t\t\t\t\t\t\tset_state(StateMachineState::Disconnected);\n",
+        "\t\t\t\t\t\t\t\tLOG_ERROR(\"[VT]: An object pool failed to upload. Resetting connection to VT.\");\n"
+        "\t\t\t\t\t\t\t\tset_state(StateMachineState::Disconnected);\n"
+        "\t\t\t\t\t\t\t\t// AgIsoAuxInputs patch: don't start the next part's transfer\n"
+        "\t\t\t\t\t\t\t\tallPoolsProcessed = false;\n"
+        "\t\t\t\t\t\t\t\tbreak;\n",
+    ),
+    (
+        "multi-part upload: no stale transfer state",
+        "\t\t\t\t\tif (firstTimeInState)\n"
+        "\t\t\t\t\t{\n"
+        "\t\t\t\t\t\tif (get_any_pool_needs_scaling())\n",
+        "\t\t\t\t\tif (firstTimeInState)\n"
+        "\t\t\t\t\t{\n"
+        "\t\t\t\t\t\t// AgIsoAuxInputs patch: a transfer of an earlier connection can't still be running\n"
+        "\t\t\t\t\t\tcurrentObjectPoolState = CurrentObjectPoolUploadState::Uninitialized;\n"
+        "\t\t\t\t\t\tif (get_any_pool_needs_scaling())\n",
     ),
 ]
 
