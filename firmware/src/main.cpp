@@ -51,6 +51,15 @@
 #include <WiFi.h>
 #endif
 
+#if defined(ENABLE_SEEDER_COMBO)
+#include "object_pool/seeder_pool_parts.h"
+#include "seeder_app.hpp"
+#include "storage.hpp"
+#include "esp32s3/spiram.h"
+#include "esp_efuse.h"
+#include "esp_efuse_table.h"
+#endif
+
 // I2C pins
 #define I2C_SDA 39
 #define I2C_SCL 38
@@ -84,6 +93,12 @@ public:
                            const std::string &text) override {
     // Debug level is chatty (every TP session...): serial only, so the
     // /debug log keeps the VT handshake, warnings and errors.
+#if defined(ENABLE_SEEDER_COMBO)
+    // Both working sets share the VT partner, so each VT client also sees
+    // (and rejects) every VT message to the other one
+    if (text == "[VT]: VT-ECU Client message invalid")
+      level = LoggingLevel::Debug;
+#endif
     if (level >= LoggingLevel::Info)
       debug_log("%s", text.c_str());
     else
@@ -96,6 +111,159 @@ static ArduinoCANStackLogger canStackLogger;
 using BaseTWAIPlugin = canlink_bridge::BridgedTWAIPlugin;
 #else
 using BaseTWAIPlugin = isobus::TWAIPlugin;
+#endif
+
+#if defined(ENABLE_SEEDER_COMBO)
+// TEST: traces our outgoing ETP sessions (ISO 11783-3 5.11) from the raw
+// frames, to see whether a slow pool upload advances or the VT keeps asking
+// for the same packets again: a CTS whose next packet number goes backwards
+// is a retransmit request.
+namespace etp_trace {
+constexpr uint8_t PF_CM = 0xC8; // ETP.CM, PGN 0xC800
+constexpr uint8_t PF_DT = 0xC7; // ETP.DT, PGN 0xC700
+constexpr uint8_t RTS = 0x14, CTS = 0x15, DPO = 0x16, EOMA = 0x17, ABORT = 0xFF;
+constexpr uint32_t PROGRESS_LOG_PACKETS = 1000;
+
+struct Session {
+  uint8_t source = 0xFF; // our address
+  uint8_t destination = 0xFF;
+  bool active = false;
+  uint32_t bytes = 0, packets = 0;
+  uint32_t highestNext = 0; // highest next packet number the receiver asked for
+  uint32_t ctsCount = 0, holdCount = 0, retransmits = 0;
+  uint32_t dataFrames = 0;
+  uint32_t startMs = 0, lastCtsMs = 0, longestCtsGapMs = 0;
+  uint32_t lastProgressLog = 0;
+  uint32_t completed = 0, aborted = 0;
+};
+static Session sessions[2]; // one per working set on this board
+
+static Session *session_for(uint8_t source) {
+  for (Session &s : sessions)
+    if (s.source == source)
+      return &s;
+  for (Session &s : sessions)
+    if (s.source == 0xFF) {
+      s.source = source;
+      return &s;
+    }
+  return nullptr;
+}
+
+static uint32_t u24(const uint8_t *d) { return d[0] | (d[1] << 8) | ((uint32_t)d[2] << 16); }
+static uint32_t u32(const uint8_t *d) { return u24(d) | ((uint32_t)d[3] << 24); }
+
+// A frame we transmit
+static void on_tx(const isobus::CANMessageFrame &f) {
+  if (!f.isExtendedFrame || f.dataLength < 8)
+    return;
+  const uint8_t pf = (f.identifier >> 16) & 0xFF;
+  if (pf != PF_CM && pf != PF_DT)
+    return;
+  Session *s = session_for(f.identifier & 0xFF);
+  if (!s)
+    return;
+  if (pf == PF_DT) {
+    s->dataFrames++;
+    return;
+  }
+  if (f.data[0] == RTS) {
+    const uint32_t now = millis();
+    const uint32_t completed = s->completed, aborted = s->aborted;
+    *s = Session();
+    s->source = f.identifier & 0xFF;
+    s->completed = completed;
+    s->aborted = aborted;
+    s->destination = (f.identifier >> 8) & 0xFF;
+    s->active = true;
+    s->bytes = u32(&f.data[1]);
+    s->packets = (s->bytes + 6) / 7;
+    s->startMs = s->lastCtsMs = now;
+    debug_log("[ETP] %u->%u RTS %lu bytes, %lu packets, PGN 0x%05lX", s->source, s->destination,
+              (unsigned long)s->bytes, (unsigned long)s->packets, (unsigned long)u24(&f.data[5]));
+  } else if (f.data[0] == ABORT && s->active) {
+    s->active = false;
+    s->aborted++;
+    debug_log("[ETP] %u->%u we aborted (reason %u) at packet %lu of %lu", s->source, s->destination,
+              f.data[1], (unsigned long)s->highestNext, (unsigned long)s->packets);
+  }
+}
+
+// A frame we receive (from the bus or the CANlink client)
+static void on_rx(const isobus::CANMessageFrame &f) {
+  if (!f.isExtendedFrame || f.dataLength < 8 || ((f.identifier >> 16) & 0xFF) != PF_CM)
+    return;
+  const uint8_t destination = (f.identifier >> 8) & 0xFF;
+  Session *s = nullptr;
+  for (Session &candidate : sessions)
+    if (candidate.source == destination)
+      s = &candidate;
+  if (!s || !s->active)
+    return;
+  const uint32_t now = millis();
+  switch (f.data[0]) {
+    case CTS: {
+      const uint8_t count = f.data[1];
+      const uint32_t next = u24(&f.data[2]);
+      s->ctsCount++;
+      s->longestCtsGapMs = max(s->longestCtsGapMs, now - s->lastCtsMs);
+      s->lastCtsMs = now;
+      if (0 == count) {
+        s->holdCount++; // receiver asks to wait
+      } else if (next < s->highestNext) {
+        s->retransmits++;
+        if (s->retransmits <= 5)
+          debug_log("[ETP] %u->%u CTS asks again from packet %lu (had %lu), %u packets", s->source,
+                    s->destination, (unsigned long)next, (unsigned long)s->highestNext, count);
+      }
+      if (next > s->highestNext)
+        s->highestNext = next;
+      if (s->highestNext - s->lastProgressLog >= PROGRESS_LOG_PACKETS) {
+        s->lastProgressLog = s->highestNext;
+        debug_log("[ETP] %u->%u at packet %lu of %lu after %lu s, %u per CTS, longest CTS gap %lu ms, "
+                  "%lu retransmit requests, %lu holds",
+                  s->source, s->destination, (unsigned long)next, (unsigned long)s->packets,
+                  (unsigned long)((now - s->startMs) / 1000), count,
+                  (unsigned long)s->longestCtsGapMs, (unsigned long)s->retransmits,
+                  (unsigned long)s->holdCount);
+      }
+      break;
+    }
+    case EOMA:
+      s->active = false;
+      s->completed++;
+      debug_log("[ETP] %u->%u done: %lu bytes in %lu s, %lu CTS, longest gap %lu ms, %lu retransmit "
+                "requests, %lu data frames sent",
+                s->source, s->destination, (unsigned long)u32(&f.data[1]),
+                (unsigned long)((now - s->startMs) / 1000), (unsigned long)s->ctsCount,
+                (unsigned long)s->longestCtsGapMs, (unsigned long)s->retransmits,
+                (unsigned long)s->dataFrames);
+      break;
+    case ABORT:
+      s->active = false;
+      s->aborted++;
+      debug_log("[ETP] %u->%u receiver aborted (reason %u) at packet %lu of %lu", s->source,
+                s->destination, f.data[1], (unsigned long)s->highestNext, (unsigned long)s->packets);
+      break;
+    default:
+      break;
+  }
+}
+
+static void debug_status(String &out) {
+  out += "ETP uploads (ours)\n";
+  for (const Session &s : sessions) {
+    if (s.source == 0xFF)
+      continue;
+    out += "  " + String(s.source) + "->" + String(s.destination) + ": " +
+           (s.active ? "active" : "idle") + ", packet " + String(s.highestNext) + " of " +
+           String(s.packets) + " (" + String(s.bytes) + " bytes), " + String(s.ctsCount) +
+           " CTS, longest gap " + String(s.longestCtsGapMs) + " ms, " + String(s.retransmits) +
+           " retransmit requests, " + String(s.holdCount) + " holds, " + String(s.dataFrames) +
+           " data frames; " + String(s.completed) + " done, " + String(s.aborted) + " aborted\n";
+  }
+}
+} // namespace etp_trace
 #endif
 
 // TWAIPlugin with a minimum gap between transmitted frames. Back-to-back
@@ -114,8 +282,20 @@ public:
     if (!BaseTWAIPlugin::write_frame(canFrame))
       return false;
     lastTxMicros = now;
+#if defined(ENABLE_SEEDER_COMBO)
+    etp_trace::on_tx(canFrame);
+#endif
     return true;
   }
+
+#if defined(ENABLE_SEEDER_COMBO)
+  bool read_frame(isobus::CANMessageFrame &canFrame) override {
+    if (!BaseTWAIPlugin::read_frame(canFrame))
+      return false;
+    etp_trace::on_rx(canFrame);
+    return true;
+  }
+#endif
 
 private:
   static constexpr uint32_t MIN_TX_GAP_US = 2000;
@@ -125,6 +305,7 @@ private:
 static Adafruit_ADS1115 ads;
 static std::shared_ptr<isobus::VirtualTerminalClient> vtClient = nullptr;
 static std::shared_ptr<isobus::InternalControlFunction> internalECU = nullptr;
+static std::shared_ptr<isobus::PartneredControlFunction> partnerVT = nullptr;
 
 // Mutable RAM copy of the selected pool: set_object_pool() reads from this
 // pointer lazily as the pool uploads, so adaptPoolToVt() (once the connected
@@ -422,7 +603,7 @@ static void setupIsobus() {
   internalECU =
       isobus::CANNetworkManager::CANNetwork.create_internal_control_function(
           deviceName, 0);
-  auto partnerVT =
+  partnerVT =
       isobus::CANNetworkManager::CANNetwork
           .create_partnered_control_function(0, vtNameFilters);
   if (auto requests = internalECU->get_pgn_request_protocol().lock()) {
@@ -491,6 +672,114 @@ static void adaptPoolToVt() {
       isobus::IOPFileInterface::hash_object_pool_to_version(poolBuffer, layout.size));
 }
 
+#if defined(ENABLE_SEEDER_COMBO)
+// TEST: the seeder controller (github.com/davidbalogh92/Isobus_ESP_seeder_V2)
+// as a second working set with its own NAME, address, VT and TC clients.
+// It runs on simulated inputs (all-idle HwInputs, its own speed simulation
+// setting); settings and counters persist in its own NVS namespace.
+static app::Shared seederShared;
+static std::unique_ptr<app::SeederApp> seederApp;
+static uint32_t lastSeederTick = 0;
+static float seederSaveTimer = 0.0f;
+static constexpr uint32_t SEEDER_CYCLE_MS = 20; // its control cycle
+
+static void seederSetup() {
+  if (!storage::init())
+    debug_log("[SEEDER] NVS init failed");
+  seeder::Settings settings;
+  seeder::Persistent persistent;
+  const bool hadSettings = storage::load_settings(settings);
+  storage::load_persistent(persistent);
+  seederShared.core.load(settings, persistent);
+
+  app::SeederApp::PoolPart parts[SEEDER_POOL_PART_COUNT];
+  uint32_t total = 0;
+  for (uint8_t i = 0; i < SEEDER_POOL_PART_COUNT; i++) {
+    parts[i] = {SEEDER_POOL_PARTS[i], SEEDER_POOL_PART_SIZES[i]};
+    total += SEEDER_POOL_PART_SIZES[i];
+  }
+  // AgIsoStack scales a pool for another VT size in a RAM copy of all its
+  // parts - 150 kB, more than the free internal heap. Without PSRAM the pool
+  // goes up unscaled (400 px design size), straight from flash.
+  const bool scale = heap_caps_get_free_size(MALLOC_CAP_SPIRAM) > 512 * 1024;
+  seederApp = std::make_unique<app::SeederApp>(seederShared);
+  // The joystick's VT partner: AgIsoStack binds an address claim to one
+  // partner only, so a second partner for the same VT would never be found.
+  const bool started = seederApp->start(0, parts, SEEDER_POOL_PART_COUNT, SEEDER_POOL_VERSION,
+                                        partnerVT, scale);
+  debug_log("[SEEDER] %s: pool %lu bytes in %u parts, version %s, settings %s, %s",
+            started ? "started" : "START FAILED", (unsigned long)total,
+            (unsigned)SEEDER_POOL_PART_COUNT, SEEDER_POOL_VERSION,
+            hadSettings ? "loaded" : "defaults",
+            scale ? "scaled to the VT (PSRAM)" : "unscaled (no PSRAM)");
+}
+
+// Why PSRAM is (not) there: ESP-IDF only logs a failed boot-time init on
+// UART0. The package version says which flash/PSRAM the chip has.
+static void psramDebugStatus(String &out) {
+  uint32_t pkg = 0;
+  esp_efuse_read_field_blob(ESP_EFUSE_PKG_VERSION, &pkg, 3);
+  out += "  PSRAM: IDF init " + String(esp_spiram_is_initialized() ? "ok" : "failed") +
+         ", chip " + String(esp_spiram_get_size()) + " bytes, heap " +
+         String(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)) + " free of " +
+         String(heap_caps_get_total_size(MALLOC_CAP_SPIRAM)) + " (Arduino: found " +
+         String(psramFound() ? "yes" : "no") + ", " + String(ESP.getPsramSize()) +
+         "); chip revision " + String(ESP.getChipRevision()) + ", package " + String(pkg) + "\n";
+}
+
+static void seederLoop() {
+  const uint32_t now = millis();
+  if (now - lastSeederTick < SEEDER_CYCLE_MS)
+    return;
+  lastSeederTick = now;
+  constexpr float CYCLE_S = SEEDER_CYCLE_MS / 1000.0f;
+  seederApp->update(CYCLE_S, app::HwInputs{});
+
+  // Same as the seeder's own main loop: settings 2 s after the last change
+  bool saveSettings = false, savePersistent = false;
+  seeder::Settings settings;
+  seeder::Persistent persistent;
+  {
+    std::lock_guard<std::mutex> guard(seederShared.lock);
+    if (seederShared.core.settings_dirty) {
+      seederSaveTimer += CYCLE_S;
+      if (seederSaveTimer >= 2.0f) {
+        seederShared.core.settings_dirty = false;
+        seederSaveTimer = 0.0f;
+        saveSettings = true;
+        settings = seederShared.core.settings();
+      }
+    }
+    if (seederShared.core.persistent_dirty) {
+      seederShared.core.persistent_dirty = false;
+      savePersistent = true;
+      persistent = seederShared.core.persistent();
+    }
+  }
+  if (saveSettings && !storage::save_settings(settings))
+    debug_log("[SEEDER] saving settings failed");
+  if (savePersistent && !storage::save_persistent(persistent))
+    debug_log("[SEEDER] saving counters failed");
+}
+
+static void seederDebugStatus(String &out) {
+  const app::IsobusDiag d = seederApp->diag();
+  out += "Seeder (second working set)\n  address ";
+  out += d.address_claimed ? String(d.address) : "not claimed";
+  out += ", VT " + String(d.vt_connected ? "connected" : (d.vt_found ? "found" : "not found")) +
+         " (" + String(d.vt_width) + "x" + String(d.vt_height) + ", soft key " +
+         String(d.vt_softkey_w) + "x" + String(d.vt_softkey_h) + "), page " + d.page.c_str() +
+         "\n  pool " + String(SEEDER_POOL_PART_COUNT) + " parts (";
+  for (uint8_t i = 0; i < SEEDER_POOL_PART_COUNT; i++)
+    out += (i ? " + " : "") + String(SEEDER_POOL_PART_SIZES[i]);
+  out += " bytes), version " SEEDER_POOL_VERSION ", VT commands " + String(d.vt_cmd_sent) +
+         " sent / " + String(d.vt_cmd_failed) + " failed\n  TC " +
+         String(d.tc_connected ? "connected" : (d.tc_found ? "found" : "not found")) +
+         ", DDOP uploads " + String(d.ddop_uploads) + "\n";
+  psramDebugStatus(out);
+}
+#endif
+
 static const char *vtVersionName(isobus::VirtualTerminalClient::VTVersion version) {
   switch (version) {
     case isobus::VirtualTerminalClient::VTVersion::Version2OrOlder: return "2 or older";
@@ -550,6 +839,11 @@ static void handleDebug() {
            String(twai.msgs_to_tx) + "\n";
   }
   out += "\n";
+#if defined(ENABLE_SEEDER_COMBO)
+  seederDebugStatus(out);
+  etp_trace::debug_status(out);
+  out += "\n";
+#endif
   wifi_debug_status(out);
 #if defined(ENABLE_CANLINK_BRIDGE)
   out += "\n";
@@ -619,6 +913,9 @@ void setup() {
   Serial.println("[AUX-N] ISOBUS stack started, claiming address...");
   lights_setup(vtClient);
   settings_setup(vtClient);
+#if defined(ENABLE_SEEDER_COMBO)
+  seederSetup();
+#endif
 
 #if defined(ENABLE_OTA_WEBSERVER)
   ota_setup(); // Wi-Fi + mDNS, which the bridge needs
@@ -700,6 +997,9 @@ void loop() {
   settings_update();
   aux_buttons_update();
   syncCommitOnConnect();
+#if defined(ENABLE_SEEDER_COMBO)
+  seederLoop();
+#endif
 
   uint32_t now = millis();
   if (now - lastPollTime >= POLL_INTERVAL_MS) {
