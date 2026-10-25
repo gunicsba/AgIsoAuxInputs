@@ -47,6 +47,7 @@
 
 #if defined(ENABLE_OTA_WEBSERVER)
 #include <ESP2SOTA.h>
+#include <Preferences.h>
 #include <WebServer.h>
 #include <WiFi.h>
 #endif
@@ -266,18 +267,23 @@ static void debug_status(String &out) {
 } // namespace etp_trace
 #endif
 
-// TWAIPlugin with a minimum gap between transmitted frames. Back-to-back
-// TP data frames during an object pool upload drove the bus to bus-off on
-// every attempt (most likely the VT's CAN adapter overrunning and answering
-// with error frames). A write refused here stays queued in the stack and is
-// retried on the next update().
+// Minimum gap between transmitted frames, us. Back-to-back TP data frames
+// during an object pool upload drove the bus to bus-off on every attempt
+// (most likely the VT's CAN adapter overrunning and answering with error
+// frames). Set on the web page (stored in NVS), 2000 by default.
+static constexpr uint32_t DEFAULT_TX_GAP_US = 2000;
+static constexpr uint32_t MAX_TX_GAP_US = 20000;
+static volatile uint32_t txGapMicros = DEFAULT_TX_GAP_US;
+
+// TWAIPlugin keeping txGapMicros between transmitted frames. A write
+// refused here stays queued in the stack and is retried on the next update().
 class PacedTWAIPlugin : public BaseTWAIPlugin {
 public:
   using BaseTWAIPlugin::BaseTWAIPlugin;
 
   bool write_frame(const isobus::CANMessageFrame &canFrame) override {
     uint32_t now = micros();
-    if (now - lastTxMicros < MIN_TX_GAP_US)
+    if (now - lastTxMicros < txGapMicros)
       return false;
     if (!BaseTWAIPlugin::write_frame(canFrame))
       return false;
@@ -298,7 +304,6 @@ public:
 #endif
 
 private:
-  static constexpr uint32_t MIN_TX_GAP_US = 2000;
   uint32_t lastTxMicros = 0;
 };
 
@@ -808,8 +813,27 @@ static void handleOtaRoot() {
   for (uint8_t i = 0; i < NUM_AUX_BUTTONS; i++) {
     html += buttonStates[i] ? "1" : "0";
   }
-  html += "</p></body></html>";
+  html += "</p><form method='post' action='/can'>CAN frame gap: <input name='gap' type='number' "
+          "min='0' max='" + String(MAX_TX_GAP_US) + "' value='" + String(txGapMicros) +
+          "'> &micro;s (default " + String(DEFAULT_TX_GAP_US) +
+          "; lower is a faster pool upload, if the VT keeps up) <button>Save</button></form>"
+          "</body></html>";
   otaServer.send(200, "text/html", html);
+}
+
+// Applies right away (the next frame) and is kept across reboots.
+static void handleCanSettings() {
+  const long gap = otaServer.arg("gap").toInt();
+  if (otaServer.hasArg("gap") && gap >= 0 && gap <= (long)MAX_TX_GAP_US) {
+    txGapMicros = (uint32_t)gap;
+    Preferences prefs;
+    prefs.begin("can", false);
+    prefs.putUInt("tx_gap_us", txGapMicros);
+    prefs.end();
+    debug_log("[CAN] Frame gap set to %lu us", (unsigned long)txGapMicros);
+  }
+  otaServer.sendHeader("Location", "/");
+  otaServer.send(303);
 }
 
 // Plain text, so it reads the same in a browser and from curl.
@@ -836,7 +860,7 @@ static void handleDebug() {
     out += "  TWAI " + String(twai.state < 4 ? stateNames[twai.state] : "?") + ", tx_err " +
            String(twai.tx_error_counter) + ", rx_err " + String(twai.rx_error_counter) +
            ", bus_err " + String(twai.bus_error_count) + ", msgs_to_tx " +
-           String(twai.msgs_to_tx) + "\n";
+           String(twai.msgs_to_tx) + ", frame gap " + String(txGapMicros) + " us\n";
   }
   out += "\n";
 #if defined(ENABLE_SEEDER_COMBO)
@@ -863,6 +887,7 @@ static void ota_setup() {
 #endif
 
   otaServer.on("/", HTTP_GET, handleOtaRoot);
+  otaServer.on("/can", HTTP_POST, handleCanSettings);
   otaServer.on("/debug", HTTP_GET, handleDebug);
   otaServer.begin();
   ESP2SOTA.begin(&otaServer);
@@ -909,6 +934,14 @@ void setup() {
   detectExtenderPCA9555();
 
   settings_load(); // the page mode picks the object pool
+#if defined(ENABLE_OTA_WEBSERVER)
+  {
+    Preferences prefs;
+    prefs.begin("can", true);
+    txGapMicros = min(prefs.getUInt("tx_gap_us", DEFAULT_TX_GAP_US), MAX_TX_GAP_US);
+    prefs.end();
+  }
+#endif
   setupIsobus();
   Serial.println("[AUX-N] ISOBUS stack started, claiming address...");
   lights_setup(vtClient);
