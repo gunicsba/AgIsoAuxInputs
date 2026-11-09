@@ -20,15 +20,18 @@ Auxiliary Input designator... shall fit inside a Soft Key designator"), the
 designator child isn't restricted to picture graphics - a small OutputString
 is valid and much simpler than encoding bitmap icons.
 
-Pools are built for two page modes: "single" (one AUX input per button) and
-"multi" (T1-T4 select a page; the other buttons have an input per page plus
-an all-pages "*" input), the firmware picking one at boot from its settings.
-Each comes in two data mask layouts, "full" (480x480) and "compact"
-(200x200), which the firmware scales to the connected VT (see "Scaling").
+Two device layouts: A, the Handgrip keypad (a PCA9555 at 0x21-0x23), and
+B, a grip with 10 round buttons wired to the brain board's own PCA9555
+(0x20) and no LEDs. Layout A comes in two page modes: "single" (one AUX input
+per button) and "multi" (T1-T4 select a page; the other buttons have an input
+per page plus an all-pages "*" input); B is single only. The firmware picks
+one of these three pools at boot from its settings. Each comes in two data
+mask layouts, "full" (480x480) and "compact" (200x200), which the firmware
+scales to the connected VT (see "Scaling").
 
 Run this script (from firmware/) whenever object IDs/count/text need to change:
     python tools/build_aux_pool.py
-It (re)writes src/object_pool/aux_n_pool_{single,multi}_{full,compact}.iop,
+It (re)writes src/object_pool/aux_n_pool_{single,multi,b}_{full,compact}.iop,
 src/object_pool/object_pool_ids.h and src/object_pool/aux_n_pool_data.h.
 After a layout change, run tools/check_pool_scaling.py: it scales the pools
 for a range of VTs like the firmware does and checks that everything fits.
@@ -120,6 +123,40 @@ STR_PAGE_COLOUR_BASE = 74      # + page index 0..3
 BTN_PRESS_FLASH = 78
 STR_PRESS_FLASH = 79
 STR_SETTINGS_TITLE = 80
+# Device layout dropdown (Input List; its value is the layout index)
+INPUT_LAYOUT = 81
+STR_LAYOUT_ITEM_BASE = 82      # + layout index
+LAYOUT_FRAME = 85
+DEVICE_LAYOUTS = ["A", "B"]
+
+# Layout B's button teach-in (see src/button_teach.h): the TEACH soft key on
+# the main mask starts it, and swaps in a soft key mask with SKIP (for a
+# button that isn't wired) and CANCEL. The prompt ("PRESS Y1") goes into the
+# main title, so layout B's title is padded to TITLE_TEXT_LENGTH.
+KEY_TEACH = 86
+STR_KEY_TEACH = 87
+TEACH_SOFT_KEY_MASK = 88
+KEY_TEACH_SKIP = 89
+STR_KEY_TEACH_SKIP = 90
+KEY_TEACH_CANCEL = 91
+STR_KEY_TEACH_CANCEL = 92
+TITLE_TEXT_LENGTH = 16
+
+# Layout B's INPUTS page (Settings -> INPUTS): one button per round button,
+# toggling it between momentary and latching. The pools ship every B input
+# momentary; the firmware patches the latching ones' function type (byte
+# AUX_INPUT_FUNCTION_TYPE_OFFSET of the object) before the upload.
+INPUTS_MASK = 93
+INPUTS_SOFT_KEY_MASK = 94
+KEY_INPUTS = 95
+STR_KEY_INPUTS = 96
+STR_INPUTS_TITLE = 97
+BTN_INPUT_TYPE_BASE = 240      # + B button index
+STR_INPUT_TYPE_BASE = 250      # + B button index
+INPUT_TYPE_TEXTS = (b"MOMENTARY", b"LATCHING")
+INPUT_TYPE_TEXT_LENGTH = len(b"Y1: ") + max(len(t) for t in INPUT_TYPE_TEXTS)
+AUX_INPUT_FUNCTION_TYPE_OFFSET = 4
+LAYOUT_ITEM_TEXTS = [f"LAYOUT {name}".encode("ascii") for name in DEVICE_LAYOUTS]
 PAGE_MODE_TEXT = b"PAGES: SINGLE"
 RESTART_HINT_TEXT = b"                        "   # "RESTART TO APPLY" when pending
 PAGE_COLOUR_TEXT = b"PAGE 1: MAGENTA"
@@ -133,6 +170,7 @@ PRESS_FLASH_TEXT = b"PRESS FLASH: ON "
 # keeps separate preferred assignments for the two input sets.
 MODEL_ID_SINGLE = 1
 MODEL_ID_MULTI = 2
+MODEL_ID_B = 3
 NUM_PAGES = 4
 PAGED_LAYERS = NUM_PAGES + 1   # layer 4 = all pages ("*")
 PAGE_SELECT_LABELS = ["T1", "T2", "T3", "T4"]   # page 1..4
@@ -198,6 +236,7 @@ BUTTON_LABELS = [
 ]
 
 # --- AuxiliaryInputType2 function types (ISO 11783-6:2018 Table J.5) --------
+FUNCTION_TYPE_BOOLEAN_LATCHED = 0               # latching switch, maintains position
 FUNCTION_TYPE_ANALOGUE_MAINTAINS_POSITION = 1   # potentiometer / joystick axis
 FUNCTION_TYPE_BOOLEAN_MOMENTARY = 2             # push button, returns to off
 
@@ -208,7 +247,9 @@ TYPE_SOFT_KEY_MASK = 4
 TYPE_KEY = 5
 TYPE_BUTTON = 6
 TYPE_INPUT_NUMBER = 9
+TYPE_INPUT_LIST = 10
 TYPE_OUTPUT_RECTANGLE = 14
+TYPE_OUTPUT_ELLIPSE = 15
 TYPE_LINE_ATTRIBUTES = 24
 TYPE_FILL_ATTRIBUTES = 25
 TYPE_OUTPUT_STRING = 11
@@ -305,7 +346,10 @@ JUSTIFY_HORIZONTAL_MASK = 0b0011
 # VT standard palette indices (ISO 11783-6 Table A.3)
 COLOUR_BLACK = 0
 COLOUR_WHITE = 1
+COLOUR_GREEN = 2
 COLOUR_SILVER = 7
+COLOUR_BLUE = 9
+COLOUR_RED = 12
 COLOUR_YELLOW = 14
 
 # --- Layouts ------------------------------------------------------------------
@@ -358,6 +402,31 @@ def joy_led_centres(centres, button: int, led: int):
     ]
 
 
+# Layout B: 10 round buttons, top to bottom, left to right, each with its
+# colour, its default input bit (0-15 a keypad PCA9555, 16-31 the brain
+# board's own one at 0x20; the teach-in on the VT learns the real wiring, see
+# src/button_teach.h) and its centre on the 480x480 mask: three columns, as
+# on the grip. Its AUX inputs (AUX_B_BASE + index) are its own: B has its own
+# NAME (identity number 3) and model identification code.
+B_LEFT_X, B_CENTRE_X, B_RIGHT_X = 124, 240, 356
+B_BUTTONS = [
+    # label, input bit, colour, centre
+    ("Y1", 16 + 0, COLOUR_YELLOW, (B_CENTRE_X, 96)),
+    ("R1", 16 + 1, COLOUR_RED, (B_LEFT_X, 150)),
+    ("G1", 16 + 2, COLOUR_GREEN, (B_RIGHT_X, 153)),
+    ("Y2", 16 + 3, COLOUR_YELLOW, (B_CENTRE_X, 202)),
+    ("R2", 16 + 4, COLOUR_RED, (B_LEFT_X, 251)),
+    ("G2", 16 + 5, COLOUR_GREEN, (B_RIGHT_X, 255)),
+    ("B1", 16 + 6, COLOUR_BLUE, (B_CENTRE_X, 300)),
+    ("W1", 16 + 7, COLOUR_SILVER, (B_LEFT_X, 345)),
+    ("W2", 16 + 8, COLOUR_SILVER, (B_RIGHT_X, 357)),
+    ("B2", 16 + 9, COLOUR_BLUE, (B_CENTRE_X, 408)),
+]
+AUX_B_BASE = 220               # 220..229
+DESIGNATOR_B_BASE = 420        # 420..429
+B_BUTTON_DIAMETER = 60         # on the 480 mask
+
+
 class Layout:
     """Data mask geometry for one reference mask size. Texts the firmware
     rewrites at runtime keep their length in every layout; only static texts
@@ -385,6 +454,14 @@ FULL = Layout(
                       BTN_PAGE_COLOUR_BASE + 2: (10, 200), BTN_PAGE_COLOUR_BASE + 3: (250, 200),
                       BTN_PRESS_FLASH: (10, 260)},
     restart_hint=(10, 108, 460, 24),
+    layout_list=(220, 34), layout_list_at=(250, 268),
+    # Layout B: no page mode, page colours or press flash (no LEDs)
+    settings_buttons_b={BTN_RESTART: (250, 50)}, layout_list_at_b=(10, 58),
+    restart_hint_b=(10, 108),
+    # INPUTS page: two columns of five
+    input_type_button=(220, 50, 5),
+    input_type_at=[(10 + (i % 2) * 240, 50 + (i // 2) * 60) for i in range(10)],
+    inputs_restart_hint=(10, 350), inputs_restart=(250, 390),
 )
 
 # 200x200 (e.g. AMATRON 3): everything in 6x8 except the title, one settings
@@ -410,6 +487,12 @@ COMPACT = Layout(
                       BTN_PAGE_COLOUR_BASE + 2: (4, 116), BTN_PAGE_COLOUR_BASE + 3: (4, 138),
                       BTN_PRESS_FLASH: (4, 160)},
     restart_hint=(4, 60, 192, 10),
+    layout_list=(192, 16), layout_list_at=(4, 182),
+    settings_buttons_b={BTN_RESTART: (4, 40)}, layout_list_at_b=(4, 18),
+    restart_hint_b=(4, 62),
+    input_type_button=(94, 20, 3),
+    input_type_at=[(4 + (i % 2) * 98, 16 + (i // 2) * 22) for i in range(10)],
+    inputs_restart_hint=(4, 128), inputs_restart=(4, 142),
 )
 LAYOUTS = (FULL, COMPACT)
 
@@ -436,9 +519,11 @@ class Pool(bytearray):
         self.scale_fields = []       # (offset, kind, square value, wide value)
         self.sizes = {}              # object ID -> (w, h), for check_mask_bounds()
         self.placements = []         # (mask ID, child ID, x, y)
+        self.offsets = {}            # object ID -> offset in the pool
 
     def __iadd__(self, obj):
         base = len(self)
+        self.offsets[obj[0] | (obj[1] << 8)] = base
         object_id = obj[0] | (obj[1] << 8)
         if getattr(obj, "size", None):
             self.sizes[object_id] = obj.size
@@ -617,11 +702,44 @@ def build_output_rectangle(object_id: int, line_id: int, width: int, height: int
     return o.done()
 
 
-def build_button(object_id: int, label_id: int, layout: Layout):
+def build_output_ellipse(object_id: int, line_id: int, width: int, height: int,
+                         fill_id: int):
+    # ID(2) type(1) lineAttr(2) width(2) height(2) ellipseType(1)
+    # startAngle(1) endAngle(1) fillAttr(2) nMacros(1) = 15 bytes
+    o = Obj(object_id, TYPE_OUTPUT_ELLIPSE)
+    o.u16(line_id)
+    o.mask_wh(width, height)
+    o.u8(0)                    # closed ellipse
+    o.u8(0)                    # start angle (unused when closed)
+    o.u8(0)                    # end angle
+    o.u16(fill_id)
+    o.u8(0)                    # 0 macros
+    return o.done()
+
+
+def build_input_list(object_id: int, item_ids, value: int, layout: Layout):
+    # ID(2) type(1) width(2) height(2) varRef(2) value(1) nItems(1) options(1)
+    # nMacros(1) = 13 bytes, then the item object IDs. The VT draws the
+    # selected item at the list's top left and reports a new selection with
+    # a Change Numeric Value message (value = item index).
+    w, h = layout.layout_list
+    o = Obj(object_id, TYPE_INPUT_LIST)
+    o.mask_wh(w, h)
+    o.u16(NULL_OBJECT_ID)      # no number variable -> inline value
+    o.u8(value)
+    o.u8(len(item_ids))
+    o.u8(1)                    # options: enabled, no real-time editing
+    o.u8(0)                    # 0 macros
+    for item_id in item_ids:
+        o.u16(item_id)
+    return o.done()
+
+
+def build_button(object_id: int, label_id: int, layout: Layout, size=None):
     # header: ID(2) type(1) width(2) height(2) bg(1) border(1) keyCode(1)
     # options(1) nChildren(1) nMacros(1) = 13 bytes, then (objectID, x, y)
     # per child. Options 0 = momentary, VT-drawn border, enabled.
-    w, h, margin = layout.button
+    w, h, margin = size or layout.button
     o = Obj(object_id, TYPE_BUTTON)
     o.mask_wh(w, h)
     o.u8(COLOUR_SILVER)        # background colour
@@ -636,8 +754,8 @@ def build_button(object_id: int, label_id: int, layout: Layout):
     return o.done()
 
 
-def build_button_label(object_id: int, text: bytes, layout: Layout):
-    w, h, margin = layout.button
+def build_button_label(object_id: int, text: bytes, layout: Layout, size=None):
+    w, h, margin = size or layout.button
     return build_output_string(object_id, w - 2 * margin, h - 2 * margin, TEST_FONT,
                                COLOUR_SILVER, text, layout, justify=JUSTIFY_CENTERED,
                                transparent=True)
@@ -775,7 +893,22 @@ def paged_label(label: str, layer: int):
     return label + ("*" if layer == NUM_PAGES else str(layer + 1))
 
 
-def build_pool(multi: bool, L: Layout):
+def b_button_geometry(L: Layout):
+    """Layout B: (x, y, diameter) of each round button's bounding square, and
+    the label box height: one font high, centred on the button (VT3 has no
+    vertical justification)."""
+    scale = L.mask / FULL_MASK
+    diameter = round(B_BUTTON_DIAMETER * scale)
+    return [(round(cx * scale) - diameter // 2, round(cy * scale) - diameter // 2, diameter)
+            for _, _, _, (cx, cy) in B_BUTTONS], FONT_SIZES[L.fonts[TEST_FONT]][1]
+
+
+POOLS = ["single", "multi", "b"]   # layout A single-page, A multi-page, B
+
+
+def build_pool(kind: str, L: Layout):
+    multi = kind == "multi"
+    device = 1 if kind == "b" else 0   # index into DEVICE_LAYOUTS
     pool = Pool()
     pool += build_working_set()
     button = L.joy_button
@@ -785,7 +918,14 @@ def build_pool(multi: bool, L: Layout):
         (STR_REPO_URL, *L.repo_url[:2]),
         (STR_COMMIT, *L.commit[:2]),
     ]
-    for label, (cx, cy) in L.joy_centres.items():
+    b_circles, b_label_h = b_button_geometry(L)
+    if device == 1:
+        for i, (x, y, d) in enumerate(b_circles):
+            main_children += [
+                (JOY_BUTTON_RECT_BASE + i, x, y),
+                (JOY_BUTTON_LABEL_BASE + i, x, y + (d - b_label_h) // 2),
+            ]
+    for label, (cx, cy) in (L.joy_centres.items() if device == 0 else ()):
         bit = BUTTON_LABELS.index(label)
         x, y = cx - button // 2, cy - button // 2
         main_children += [
@@ -804,7 +944,7 @@ def build_pool(multi: bool, L: Layout):
                     PAGE_IND_RECT_BASE + bit * NUM_PAGES + page,
                     x + ind_margin + page * ind_pitch,
                     y + button - ind_h - ind_margin))
-    led_centres = joy_led_centres(L.joy_centres, button, L.joy_led)
+    led_centres = joy_led_centres(L.joy_centres, button, L.joy_led) if device == 0 else []
     for led, (cx, cy) in enumerate(led_centres):
         main_children.append((JOY_LED_RECT_BASE + led, cx - L.joy_led // 2,
                               cy - L.joy_led // 2))
@@ -827,23 +967,61 @@ def build_pool(multi: bool, L: Layout):
             (input_id, input_x, y),
         ]
     pool += build_data_mask(LIGHTS_MASK, LIGHTS_SOFT_KEY_MASK, lights_children)
+    settings_buttons = L.settings_buttons if device == 0 else L.settings_buttons_b
+    list_x, list_y = L.layout_list_at if device == 0 else L.layout_list_at_b
     pool += build_data_mask(SETTINGS_MASK, SETTINGS_SOFT_KEY_MASK, [
         (STR_SETTINGS_TITLE, *L.settings_title[:2]),
-        (STR_RESTART_HINT, *L.restart_hint[:2]),
-        *((button_id, x, y) for button_id, (x, y) in L.settings_buttons.items()),
+        (STR_RESTART_HINT, *(L.restart_hint[:2] if device == 0 else L.restart_hint_b)),
+        *((button_id, x, y) for button_id, (x, y) in settings_buttons.items()),
+        # Frame first so the list is drawn on top of it.
+        (LAYOUT_FRAME, list_x - margin, list_y - margin),
+        (INPUT_LAYOUT, list_x, list_y),
     ])
+    # Layout B has no LEDs: no light keys. (The Lights mask stays in the pool,
+    # unreachable, so the firmware's light updates still find their objects.)
     pool += build_soft_key_mask(MAIN_SOFT_KEY_MASK,
-                                [KEY_LIGHTS_TOGGLE, KEY_LIGHTS_PAGE, KEY_SETTINGS])
+                                [KEY_LIGHTS_TOGGLE, KEY_LIGHTS_PAGE, KEY_SETTINGS]
+                                if device == 0 else [KEY_SETTINGS, KEY_TEACH])
+    if device == 1:
+        pool += build_soft_key_mask(TEACH_SOFT_KEY_MASK, [KEY_TEACH_SKIP, KEY_TEACH_CANCEL])
+        for key_id, label_id, text in [(KEY_TEACH, STR_KEY_TEACH, b"TEACH"),
+                                       (KEY_TEACH_SKIP, STR_KEY_TEACH_SKIP, b"SKIP"),
+                                       (KEY_TEACH_CANCEL, STR_KEY_TEACH_CANCEL, b"CANCEL")]:
+            pool += build_key(key_id, [(label_id, KEY_LABEL_BOX)])
+            pool += build_key_label(label_id, KEY_LABEL_BOX, KEY_FONT, text)
     pool += build_soft_key_mask(LIGHTS_SOFT_KEY_MASK,
                                 [KEY_LIGHTS_TOGGLE, KEY_BACK])
-    pool += build_soft_key_mask(SETTINGS_SOFT_KEY_MASK, [KEY_BACK])
+    pool += build_soft_key_mask(SETTINGS_SOFT_KEY_MASK,
+                                [KEY_BACK] if device == 0 else [KEY_BACK, KEY_INPUTS])
+    if device == 1:
+        pool += build_data_mask(INPUTS_MASK, INPUTS_SOFT_KEY_MASK, [
+            (STR_INPUTS_TITLE, *L.settings_title[:2]),
+            *((BTN_INPUT_TYPE_BASE + i, x, y) for i, (x, y) in enumerate(L.input_type_at)),
+            # The Settings page's restart button and hint, here too
+            (STR_RESTART_HINT, *L.inputs_restart_hint),
+            (BTN_RESTART, *L.inputs_restart),
+        ])
+        pool += build_soft_key_mask(INPUTS_SOFT_KEY_MASK, [KEY_BACK])
+        pool += build_key(KEY_INPUTS, [(STR_KEY_INPUTS, KEY_LABEL_BOX)])
+        pool += build_key_label(STR_KEY_INPUTS, KEY_LABEL_BOX, KEY_FONT, b"INPUTS")
+        pool += build_output_string(STR_INPUTS_TITLE, *L.settings_title[2:], TEST_FONT,
+                                    COLOUR_WHITE, b"INPUTS", L)
+        for i, (label, _, _, _) in enumerate(B_BUTTONS):
+            text = f"{label}: ".encode("ascii") + INPUT_TYPE_TEXTS[0]
+            pool += build_button(BTN_INPUT_TYPE_BASE + i, STR_INPUT_TYPE_BASE + i, L,
+                                 L.input_type_button)
+            pool += build_button_label(STR_INPUT_TYPE_BASE + i,
+                                       text.ljust(INPUT_TYPE_TEXT_LENGTH), L,
+                                       L.input_type_button)
     for font_id, size in L.fonts.items():
         pool += build_font_attributes(font_id, size, SCALE_MASK_FONT)
     for font_id, size in KEY_FONTS.items():
         pool += build_font_attributes(font_id, size, SCALE_KEY_FONT)
     pool += build_designator(WS_DESIGNATOR, DESIGNATOR_FONT, COLOUR_WHITE, b"JOY")
 
-    for oid, did, label in zip(AUX_ANALOG_IDS, DESIGNATOR_ANALOG_IDS, ANALOG_LABELS):
+    # Layout B: its 10 buttons are all its inputs (the ADC only reads buttons)
+    for oid, did, label in zip(AUX_ANALOG_IDS, DESIGNATOR_ANALOG_IDS,
+                               ANALOG_LABELS if device == 0 else ()):
         pool += build_designator(did, DESIGNATOR_FONT, COLOUR_WHITE, label.encode("ascii"))
         pool += build_aux_input_type2(oid, FUNCTION_TYPE_ANALOGUE_MAINTAINS_POSITION, did)
 
@@ -853,7 +1031,13 @@ def build_pool(multi: bool, L: Layout):
     # assignment then always finds the input - AgIsoVirtualTerminal hangs on
     # one that doesn't exist (Open-Agriculture/AgIsoVirtualTerminal#252) - and
     # an assignment made in single mode carries over as "all pages".
-    for oid, did, label in zip(AUX_BUTTON_IDS, DESIGNATOR_BUTTON_IDS, BUTTON_LABELS):
+    for i, (label, _, _, _) in enumerate(B_BUTTONS if device == 1 else ()):
+        pool += build_designator(DESIGNATOR_B_BASE + i, DESIGNATOR_FONT, COLOUR_WHITE,
+                                 label.encode("ascii"))
+        pool += build_aux_input_type2(AUX_B_BASE + i, FUNCTION_TYPE_BOOLEAN_MOMENTARY,
+                                      DESIGNATOR_B_BASE + i)
+    for oid, did, label in zip(AUX_BUTTON_IDS, DESIGNATOR_BUTTON_IDS,
+                               BUTTON_LABELS if device == 0 else ()):
         if multi and label in PAGED_LABELS:
             label = paged_label(label, ALL_PAGES_LAYER)   # "MC*", "DL+*"
             font = PAGED_DESIGNATOR_FONT
@@ -861,7 +1045,7 @@ def build_pool(multi: bool, L: Layout):
             font = DESIGNATOR_FONT
         pool += build_designator(did, font, COLOUR_WHITE, label.encode("ascii"))
         pool += build_aux_input_type2(oid, FUNCTION_TYPE_BOOLEAN_MOMENTARY, did)
-    for label in JOY_BUTTON_CENTRES:
+    for label in (JOY_BUTTON_CENTRES if device == 0 else ()):
         if multi and label in PAGE_SELECT_LABELS:
             continue
         bit = BUTTON_LABELS.index(label)
@@ -898,19 +1082,38 @@ def build_pool(multi: bool, L: Layout):
         pool += build_button_label(label_id, text, L)
     pool += build_output_string(STR_RESTART_HINT, *L.restart_hint[2:], TEST_FONT,
                                 COLOUR_WHITE, RESTART_HINT_TEXT, L)
+    # Layout dropdown: yellow items in a black frame, like the number inputs
+    item_ids = [STR_LAYOUT_ITEM_BASE + i for i in range(len(DEVICE_LAYOUTS))]
+    pool += build_input_list(INPUT_LAYOUT, item_ids, device, L)
+    for item_id, text in zip(item_ids, LAYOUT_ITEM_TEXTS):
+        pool += build_output_string(item_id, *L.layout_list, TEST_FONT, COLOUR_YELLOW, text, L,
+                                    justify=JUSTIFY_CENTERED)
+    list_w, list_h = L.layout_list
+    pool += build_output_rectangle(LAYOUT_FRAME, INPUT_FRAME_LINE,
+                                   list_w + 2 * margin, list_h + 2 * margin)
     pool += build_key(KEY_SETTINGS, [(STR_KEY_SETTINGS, KEY_LABEL_BOX)])
     pool += build_key_label(STR_KEY_SETTINGS, KEY_LABEL_BOX, KEY_FONT, b"SETUP")
 
+    title = MAIN_TITLE_TEXT if device == 0 else MAIN_TITLE_TEXT.center(TITLE_TEXT_LENGTH)
     pool += build_output_string(STR_MAIN_TITLE, *L.title[2:], MASK_TITLE_FONT,
-                                COLOUR_WHITE, MAIN_TITLE_TEXT, L, justify=JUSTIFY_CENTERED)
+                                COLOUR_WHITE, title, L, justify=JUSTIFY_CENTERED)
     pool += build_output_string(STR_REPO_URL, *L.repo_url[2:], MASK_SMALL_FONT,
                                 COLOUR_WHITE, L.repo_url_text, L)
     pool += build_output_string(STR_COMMIT, *L.commit[2:], MASK_SMALL_FONT, COLOUR_WHITE,
                                 COMMIT_PLACEHOLDER, L, justify=JUSTIFY_RIGHT_MIDDLE)
 
-    # Handgrip picture
+    # Handgrip picture: layout B's round buttons, in their own colours
     pool += build_line_attributes(JOY_LINE, COLOUR_BLACK, L.line_width)
-    for label in JOY_BUTTON_CENTRES:
+    for i, ((label, _, colour, _), (_, _, d)) in enumerate(
+            zip(B_BUTTONS if device == 1 else (), b_circles)):
+        pool += build_fill_attributes(JOY_BUTTON_FILL_BASE + i, colour)
+        pool += build_output_ellipse(JOY_BUTTON_RECT_BASE + i, JOY_LINE, d, d,
+                                     JOY_BUTTON_FILL_BASE + i)
+        pool += build_output_string(JOY_BUTTON_LABEL_BASE + i, d, b_label_h, TEST_FONT,
+                                    COLOUR_WHITE, label.encode("ascii"), L,
+                                    justify=JUSTIFY_CENTERED, transparent=True)
+    # Layout A's square ones
+    for label in (JOY_BUTTON_CENTRES if device == 0 else ()):
         bit = BUTTON_LABELS.index(label)
         pool += build_fill_attributes(JOY_BUTTON_FILL_BASE + bit, COLOUR_WHITE)
         pool += build_output_rectangle(JOY_BUTTON_RECT_BASE + bit, JOY_LINE,
@@ -968,9 +1171,9 @@ def check_mask_bounds(pool: Pool, L: Layout):
             f"{L.name}: object {child_id} at {x},{y} ({w}x{h}) outside mask {mask_id}")
 
 
-def build_layouts(multi: bool):
-    """Both layouts of a mode, padded to the same size."""
-    pools = [build_pool(multi, layout) for layout in LAYOUTS]
+def build_layouts(kind: str):
+    """Both layouts of a pool (see POOLS), padded to the same size."""
+    pools = [build_pool(kind, layout) for layout in LAYOUTS]
     target = max(len(p) for p in pools) + STRING_VARIABLE_HEADER + 1
     for pool in pools:
         pool += build_filler(target - len(pool))
@@ -985,7 +1188,7 @@ def c_array(name: str, pool: bytes):
 
 
 def main():
-    modes = {"single": build_layouts(multi=False), "multi": build_layouts(multi=True)}
+    modes = {kind: build_layouts(kind) for kind in POOLS}
 
     # A layout change in a builder must fail here, not patch a wrong byte at
     # runtime.
@@ -1074,6 +1277,41 @@ def main():
         "// PCA9555 bits of T1..T4, which select page 1..4 in multi mode",
         "static const uint8_t PAGE_SELECT_BITS[NUM_PAGES] = {"
         + ", ".join(str(b) for b in PAGE_SELECT_BITS) + "};",
+        "",
+        "// Device layouts: the Settings dropdown's value is the layout index",
+        f"#define DEVICE_LAYOUT_COUNT {len(DEVICE_LAYOUTS)}",
+        "#define DEVICE_LAYOUT_A 0",
+        "#define DEVICE_LAYOUT_B 1",
+        f"#define INPUT_LAYOUT {INPUT_LAYOUT}",
+        "",
+        "// Layout B: round buttons (fill JOY_BUTTON_FILL_BASE + index), single-page only",
+        f"#define MODEL_ID_B {MODEL_ID_B}",
+        f"#define NUM_B_BUTTONS {len(B_BUTTONS)}",
+        "static const uint16_t B_BUTTON_IDS[NUM_B_BUTTONS] = {"
+        + ", ".join(str(AUX_B_BASE + i) for i in range(len(B_BUTTONS))) + "};",
+        "// Input bit of each button: 0-15 a keypad PCA9555, 16-31 the brain board's",
+        "static const uint8_t B_BUTTON_INPUT_BITS[NUM_B_BUTTONS] = {"
+        + ", ".join(str(bit) for _, bit, _, _ in B_BUTTONS) + "};",
+        "// Teach-in (layout B)",
+        f"#define KEY_TEACH {KEY_TEACH}",
+        f"#define TEACH_SOFT_KEY_MASK {TEACH_SOFT_KEY_MASK}",
+        f"#define KEY_TEACH_SKIP {KEY_TEACH_SKIP}",
+        f"#define KEY_TEACH_CANCEL {KEY_TEACH_CANCEL}",
+        f"#define MAIN_SOFT_KEY_MASK {MAIN_SOFT_KEY_MASK}",
+        f"#define STR_MAIN_TITLE {STR_MAIN_TITLE}",
+        f"#define TITLE_TEXT_LENGTH {TITLE_TEXT_LENGTH}",
+        f"#define MAIN_TITLE_TEXT \"{MAIN_TITLE_TEXT.decode()}\"",
+        "static const char *const B_BUTTON_LABELS[NUM_B_BUTTONS] = {"
+        + ", ".join(f'"{label}"' for label, _, _, _ in B_BUTTONS) + "};",
+        "// INPUTS page (layout B): momentary or latching per button",
+        f"#define INPUTS_MASK {INPUTS_MASK}",
+        f"#define KEY_INPUTS {KEY_INPUTS}",
+        f"#define BTN_INPUT_TYPE_BASE {BTN_INPUT_TYPE_BASE}",
+        f"#define STR_INPUT_TYPE_BASE {STR_INPUT_TYPE_BASE}",
+        f"#define INPUT_TYPE_TEXT_LENGTH {INPUT_TYPE_TEXT_LENGTH}",
+        "// VT palette colour of each button when released",
+        "static const uint8_t B_BUTTON_COLOURS[NUM_B_BUTTONS] = {"
+        + ", ".join(str(colour) for _, _, colour, _ in B_BUTTONS) + "};",
         "",
     ]
     header_path.write_text("\n".join(lines), encoding="ascii")
@@ -1175,12 +1413,26 @@ def main():
                 f"{prefix}_VT3_OBJECTS, {len(pool.vt3_objects)}, "
                 f"{prefix}_SCALE, {len(pool.scale_fields)}}},")
     data_lines += [
-        "// [multi-page][compact]; both layouts of a mode have the same size",
-        "static const AuxPoolLayout AUX_N_POOL_LAYOUTS[2][2] = {",
-        "  {", *layout_rows["single"], "  },",
-        "  {", *layout_rows["multi"], "  },",
+        "// The pools, indexing AUX_N_POOL_LAYOUTS",
+        "enum AuxPool : uint8_t {",
+        *[f"  AUX_POOL_{kind.upper()} = {i}," for i, kind in enumerate(POOLS)],
+        "};",
+        "// [pool][compact]; both layouts of a pool have the same size",
+        f"static const AuxPoolLayout AUX_N_POOL_LAYOUTS[{len(POOLS)}][2] = {{",
+        *[line for kind in POOLS for line in ("  {", *layout_rows[kind], "  },")],
         "};",
         f"#define AUX_N_POOL_MAX_SIZE {max(len(p) for pools in modes.values() for p in pools)}",
+        "",
+        "// Layout B: offset of each button's Auxiliary Input Type 2 object in its",
+        "// pool, [compact]; the function type is at AUX_INPUT_FUNCTION_TYPE_OFFSET",
+        f"#define AUX_N_POOL_B_INPUTS {len(B_BUTTONS)}",
+        f"static const uint16_t AUX_N_POOL_B_INPUT_OFFSETS[2][{len(B_BUTTONS)}] = {{",
+        *["    {" + ", ".join(str(pool.offsets[AUX_B_BASE + i]) for i in range(len(B_BUTTONS)))
+          + "}," for pool in modes["b"]],
+        "};",
+        f"#define AUX_INPUT_FUNCTION_TYPE_OFFSET {AUX_INPUT_FUNCTION_TYPE_OFFSET}",
+        f"#define AUX_POOL_TYPE_AUX_INPUT_2 {TYPE_AUXILIARY_INPUT_TYPE_2}",
+        f"#define AUX_FUNCTION_TYPE_LATCHED {FUNCTION_TYPE_BOOLEAN_LATCHED}",
         "",
     ]
     data_header_path.write_text("\n".join(data_lines), encoding="ascii")

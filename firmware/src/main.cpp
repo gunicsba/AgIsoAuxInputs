@@ -36,6 +36,7 @@
 
 #include "git_version.h"
 #include "aux_buttons.h"
+#include "button_teach.h"
 #include "debug_log.h"
 #include "lights.h"
 #include "object_pool/aux_n_pool_data.h"
@@ -60,6 +61,9 @@
 #include "esp_efuse.h"
 #include "esp_efuse_table.h"
 #endif
+#if defined(ENABLE_TRITON_POOL)
+#include "triton_ws.h"
+#endif
 
 // I2C pins
 #define I2C_SDA 39
@@ -73,10 +77,20 @@
 #define LED1_PIN 48
 #define LED2_PIN 47
 
-// PCA9555 addresses
+// PCA9555 addresses: the brain board's own one, and a keypad's (auto-detected
+// at boot, 0x21-0x23 by its address jumpers). 0 = not found.
 #define PCA9555_MAIN_ADDR 0x20
-// Extender address is auto-detected at boot (0x21-0x23, A0/A1/A2 strapping)
+static uint8_t pcaMainAddr = 0;
 static uint8_t pcaExtAddr = 0;
+// Button input bits: 0-15 the keypad PCA9555, 16-31 the brain board's own,
+// 32-35 an ADS1115 channel pulled low (a button wired to the ADC)
+static constexpr uint8_t NUM_INPUT_BITS = 36;
+static constexpr uint8_t MAIN_PCA_FIRST_BIT = 16;
+static constexpr uint8_t ADC_FIRST_BIT = 32;
+// A button on an ADC channel pulls it to ~0; an open one reads ~10000-13600
+// (scaled 0..0xFAFF). Pressed below the first, released above the second.
+static constexpr uint16_t ADC_BUTTON_PRESSED_BELOW = 2500;
+static constexpr uint16_t ADC_BUTTON_RELEASED_ABOVE = 5000;
 
 // PCA9555 registers
 #define PCA9555_REG_INPUT0 0x00
@@ -95,8 +109,8 @@ public:
     // Debug level is chatty (every TP session...): serial only, so the
     // /debug log keeps the VT handshake, warnings and errors.
 #if defined(ENABLE_SEEDER_COMBO)
-    // Both working sets share the VT partner, so each VT client also sees
-    // (and rejects) every VT message to the other one
+    // The working sets share the VT partner, so each VT client also sees
+    // (and rejects) every VT message to the others
     if (text == "[VT]: VT-ECU Client message invalid")
       level = LoggingLevel::Debug;
 #endif
@@ -316,7 +330,7 @@ static std::shared_ptr<isobus::PartneredControlFunction> partnerVT = nullptr;
 // pointer lazily as the pool uploads, so adaptPoolToVt() (once the connected
 // VT is known) has to patch a writable buffer.
 static uint8_t poolBuffer[AUX_N_POOL_MAX_SIZE];
-static bool poolMultiPage = false;
+static uint8_t poolKind = AUX_POOL_SINGLE; // AuxPool: device layout + page mode
 static bool poolAdapted = false;
 // What the VT reported in the current connection handshake (0 = not yet).
 // AgIsoStack's getters still hold the previous VT's values until its own
@@ -328,7 +342,7 @@ static uint8_t vtKeyHeight = 0;
 static int vtVersionByte = -1;
 
 static uint16_t analogValues[NUM_AUX_ANALOG] = {0};
-static bool buttonStates[NUM_AUX_BUTTONS] = {false}; // for the log / OTA page
+static uint64_t inputBits = 0; // pressed input bits (see NUM_INPUT_BITS), for the log / web page
 
 static uint32_t lastPollTime = 0;
 static uint32_t lastForceResync = 0;
@@ -370,64 +384,109 @@ static void syncCommitOnConnect() {
 }
 
 static void pollInputsAndReport(bool forceResync) {
-  // 4 ADS1115 channels -> analog AUX-N inputs (maintains-position pots)
+  // 4 ADS1115 channels -> analog AUX-N inputs (maintains-position pots), and
+  // input bits for buttons wired to them
+  uint64_t raw = 0;
   for (uint8_t ch = 0; ch < NUM_AUX_ANALOG; ch++) {
-    int16_t raw = ads.readADC_SingleEnded(ch);
+    int16_t adc = ads.readADC_SingleEnded(ch);
     // ADS1115 single-ended reads are 0..~32767 at GAIN_ONE. AUX-N analog
     // inputs report 0-100% as 0..0xFAFF (ISO 11783-6 Table J.5, J.7.9);
     // above that are the reserved, error and not-available ranges.
     constexpr uint32_t ADC_MAX = 32767;
     constexpr uint32_t AUX_ANALOG_MAX = 0xFAFF;
-    uint16_t scaled = (uint16_t)((uint32_t)constrain(raw, (int16_t)0, (int16_t)ADC_MAX) *
+    uint16_t scaled = (uint16_t)((uint32_t)constrain(adc, (int16_t)0, (int16_t)ADC_MAX) *
                                  AUX_ANALOG_MAX / ADC_MAX);
+    const uint64_t adcBit = 1ull << (ADC_FIRST_BIT + ch);
+    const bool wasLow = inputBits & adcBit;
+    if (scaled < ADC_BUTTON_PRESSED_BELOW || (wasLow && scaled <= ADC_BUTTON_RELEASED_ABOVE))
+      raw |= adcBit;
     uint16_t prev = analogValues[ch];
     if (forceResync || (uint16_t)abs((int32_t)scaled - (int32_t)prev) >
                             ANALOG_HYSTERESIS) {
       analogValues[ch] = scaled;
-      vtClient->update_auxiliary_input(AUX_ANALOG_IDS[ch], scaled, 0xFFFF);
+      // Layout B has no analog inputs: its ADC channels only read buttons
+      if (settings_layout() != DEVICE_LAYOUT_B)
+        vtClient->update_auxiliary_input(AUX_ANALOG_IDS[ch], scaled, 0xFFFF);
     }
   }
 
-  // 16 extender PCA9555 buttons -> momentary boolean AUX-N inputs (single
-  // or multi-page, see aux_buttons.cpp)
-  if (pcaExtAddr != 0) {
-    uint8_t port0 = ~pca9555_read(pcaExtAddr, PCA9555_REG_INPUT0);
-    uint8_t port1 = ~pca9555_read(pcaExtAddr, PCA9555_REG_INPUT1);
-    uint16_t raw = (uint16_t)port0 | ((uint16_t)port1 << 8);
-    aux_buttons_report(raw, forceResync);
-    bool anyChanged = false;
-    for (uint8_t i = 0; i < NUM_AUX_BUTTONS; i++) {
-      bool pressed = (raw & (1u << i)) != 0;
-      if (pressed != buttonStates[i]) {
-        buttonStates[i] = pressed;
-        anyChanged = true;
-      }
+  // PCA9555 buttons (pressed = low) -> momentary boolean AUX-N inputs
+  // (single or multi-page, see aux_buttons.cpp), mapped by the layout
+  if (pcaExtAddr != 0)
+    raw |= (uint16_t)~((uint16_t)pca9555_read(pcaExtAddr, PCA9555_REG_INPUT0) |
+                       ((uint16_t)pca9555_read(pcaExtAddr, PCA9555_REG_INPUT1) << 8));
+  if (pcaMainAddr != 0)
+    raw |= (uint64_t)(uint16_t)~((uint16_t)pca9555_read(pcaMainAddr, PCA9555_REG_INPUT0) |
+                                 ((uint16_t)pca9555_read(pcaMainAddr, PCA9555_REG_INPUT1) << 8))
+           << MAIN_PCA_FIRST_BIT;
+  uint16_t buttons = 0;
+  if (settings_layout() == DEVICE_LAYOUT_B) {
+    // The wiring the teach-in learned; nothing goes out while teaching
+    button_teach_input(raw);
+    const uint8_t *bits = button_teach_bits();
+    for (uint8_t i = 0; i < NUM_B_BUTTONS && !button_teach_active(); i++) {
+      if (bits[i] < NUM_INPUT_BITS && (raw & (1ull << bits[i])))
+        buttons |= 1u << i;
     }
-    if (anyChanged) {
-      char bits[NUM_AUX_BUTTONS + 1];
-      for (uint8_t i = 0; i < NUM_AUX_BUTTONS; i++) {
-        bits[i] = buttonStates[i] ? '1' : '0';
-      }
-      bits[NUM_AUX_BUTTONS] = '\0';
-      Serial.printf("[BTN] %s\n", bits);
+  } else {
+    buttons = (uint16_t)raw; // the keypad PCA9555
+  }
+  aux_buttons_report(buttons, forceResync);
+
+  // Every change goes to the /debug log, to map a new device's wiring (up
+  // to a limit, in case an unconnected pin floats)
+  static uint32_t loggedChanges = 0;
+  constexpr uint32_t MAX_LOGGED_CHANGES = 400;
+  const uint64_t changed = raw ^ inputBits;
+  inputBits = raw;
+  for (uint8_t bit = 0; bit < NUM_INPUT_BITS; bit++) {
+    if (!(changed & (1ull << bit)) || ++loggedChanges > MAX_LOGGED_CHANGES)
+      continue;
+    const char *state = (raw & (1ull << bit)) ? "pressed" : "released";
+    if (bit >= ADC_FIRST_BIT) {
+      debug_log("[BTN] input bit %u (ADS1115 A%u low) %s", bit, bit - ADC_FIRST_BIT + 1, state);
+    } else {
+      const bool main = bit >= MAIN_PCA_FIRST_BIT;
+      debug_log("[BTN] input bit %u (PCA9555 0x%02X bit %u) %s", bit,
+                main ? pcaMainAddr : pcaExtAddr, bit % MAIN_PCA_FIRST_BIT, state);
     }
   }
 }
 
-static void detectExtenderPCA9555() {
-  for (uint8_t addr = 0x21; addr <= 0x23; addr++) {
-    Wire.beginTransmission(addr);
-    if (Wire.endTransmission() == 0) {
+static void setupPCA9555(uint8_t addr) {
+  pca9555_write(addr, PCA9555_REG_CONFIG0, 0xFF); // inputs
+  pca9555_write(addr, PCA9555_REG_CONFIG1, 0xFF);
+  pca9555_write(addr, PCA9555_REG_OUTPUT0, 0xFF); // (the PCA9555 has no pull-ups)
+  pca9555_write(addr, PCA9555_REG_OUTPUT1, 0xFF);
+}
+
+static bool i2cPresent(uint8_t addr) {
+  Wire.beginTransmission(addr);
+  return Wire.endTransmission() == 0;
+}
+
+// Logs every I2C device, then takes the brain board's PCA9555 (0x20) and a
+// keypad's (the first of 0x21-0x23).
+static void detectPCA9555s() {
+  String found;
+  for (uint8_t addr = 0x08; addr < 0x78; addr++) {
+    if (!i2cPresent(addr))
+      continue;
+    char text[8];
+    snprintf(text, sizeof(text), " 0x%02X", addr);
+    found += text;
+    if (addr == PCA9555_MAIN_ADDR)
+      pcaMainAddr = addr;
+    else if (addr >= 0x21 && addr <= 0x23 && pcaExtAddr == 0)
       pcaExtAddr = addr;
-      pca9555_write(addr, PCA9555_REG_CONFIG0, 0xFF); // inputs
-      pca9555_write(addr, PCA9555_REG_CONFIG1, 0xFF);
-      pca9555_write(addr, PCA9555_REG_OUTPUT0, 0xFF); // pull-ups
-      pca9555_write(addr, PCA9555_REG_OUTPUT1, 0xFF);
-      Serial.printf("Extender PCA9555 OK @ 0x%02X\n", addr);
-      return;
-    }
   }
-  Serial.println("WARNING: no extender PCA9555 found at 0x21-0x23");
+  debug_log("[I2C] devices:%s", found.length() ? found.c_str() : " none");
+  if (pcaMainAddr)
+    setupPCA9555(pcaMainAddr);
+  if (pcaExtAddr)
+    setupPCA9555(pcaExtAddr);
+  else
+    debug_log("[I2C] no keypad PCA9555 at 0x21-0x23");
 }
 
 static void logVtHardware(const isobus::CANMessage &message) {
@@ -539,6 +598,23 @@ static bool onAddressClaimRequest(std::uint32_t, std::shared_ptr<isobus::Control
   return true;
 }
 
+// Layout B: the pools ship every button momentary; the INPUTS page's
+// latching ones become latched Booleans (ISO 11783-6 Table J.5 type 0). Only
+// where the object still is an Auxiliary Input Type 2 (a VT2 gets them
+// blanked out, see aux_pool_adapt()).
+static void applyInputTypes(const AuxPoolLayout &layout) {
+  if (poolKind != AUX_POOL_B)
+    return;
+  const uint16_t latching = settings_b_latching();
+  const bool compact = &layout == &AUX_N_POOL_LAYOUTS[AUX_POOL_B][1];
+  for (uint8_t i = 0; i < AUX_N_POOL_B_INPUTS; i++) {
+    uint8_t *object = &poolBuffer[AUX_N_POOL_B_INPUT_OFFSETS[compact][i]];
+    if ((latching & (1u << i)) && object[2] == AUX_POOL_TYPE_AUX_INPUT_2)
+      object[AUX_INPUT_FUNCTION_TYPE_OFFSET] =
+          (object[AUX_INPUT_FUNCTION_TYPE_OFFSET] & 0xE0) | AUX_FUNCTION_TYPE_LATCHED;
+  }
+}
+
 static void setupIsobus() {
   // Silence the native ESP-IDF driver logs (ANSI colour codes that show up
   // as raw escape-code clutter in most serial monitors) - the TWAI/GPIO
@@ -591,7 +667,12 @@ static void setupIsobus() {
   // model identification code). Sharing one NAME let a single-mode
   // assignment (input 206) be restored onto the multi-page input set, where
   // that input doesn't exist - and AgIsoVirtualTerminal hung.
-  deviceName.set_identity_number(settings_multi_page() ? 2 : 1);
+  // Layout B's inputs are yet another set: identity number 4. (3 was its
+  // first version, which still had A1-A4: a VT restoring an assignment to
+  // one of those onto this NAME would find no such input.)
+  deviceName.set_identity_number(settings_layout() == DEVICE_LAYOUT_B ? 4
+                                 : settings_multi_page()             ? 2
+                                                                     : 1);
   deviceName.set_ecu_instance(0);
   deviceName.set_function_instance(0);
   deviceName.set_device_class_instance(0);
@@ -630,18 +711,22 @@ static void setupIsobus() {
   // Until the VT is known, the full layout as built; adaptPoolToVt()
   // replaces it (same size) before the version label is sent.
   bool multiPage = settings_multi_page();
-  poolMultiPage = multiPage;
-  const AuxPoolLayout &layout = aux_pool_layout(multiPage, AUX_POOL_COMPACT_BELOW_MASK);
+  poolKind = settings_layout() == DEVICE_LAYOUT_B ? AUX_POOL_B
+             : multiPage                          ? AUX_POOL_MULTI
+                                                  : AUX_POOL_SINGLE;
+  const AuxPoolLayout &layout = aux_pool_layout(poolKind, AUX_POOL_COMPACT_BELOW_MASK);
   memcpy(poolBuffer, layout.data, layout.size);
+  applyInputTypes(layout);
   vtClient->set_object_pool(
       0, poolBuffer, layout.size,
       isobus::IOPFileInterface::hash_object_pool_to_version(poolBuffer, layout.size));
-  Serial.printf("[AUX-N] %s-page pool, %lu bytes\n", multiPage ? "multi" : "single",
-                (unsigned long)layout.size);
-  for (uint8_t i = 0; i < NUM_AUX_ANALOG; i++) {
+  debug_log("[AUX-N] Layout %c, %s-page pool, %lu bytes", 'A' + settings_layout(),
+            multiPage ? "multi" : "single", (unsigned long)layout.size);
+  for (uint8_t i = 0; i < NUM_AUX_ANALOG && settings_layout() != DEVICE_LAYOUT_B; i++) {
     vtClient->add_auxiliary_input_object_id(AUX_ANALOG_IDS[i]);
   }
-  aux_buttons_setup(vtClient, internalECU, multiPage);
+  aux_buttons_setup(vtClient, internalECU, multiPage, settings_layout(),
+                    settings_b_latching());
   vtClient->initialize(true);
 }
 
@@ -670,8 +755,9 @@ static void adaptPoolToVt() {
             static_cast<isobus::VirtualTerminalClient::FontSize>(size)))
       vt.fontsSupported |= 1u << size;
   }
-  const AuxPoolLayout &layout = aux_pool_layout(poolMultiPage, vtMaskSize);
+  const AuxPoolLayout &layout = aux_pool_layout(poolKind, vtMaskSize);
   aux_pool_adapt(poolBuffer, layout, vt);
+  applyInputTypes(layout);
   vtClient->set_object_pool(
       0, poolBuffer, layout.size,
       isobus::IOPFileInterface::hash_object_pool_to_version(poolBuffer, layout.size));
@@ -697,23 +783,19 @@ static void seederSetup() {
   storage::load_persistent(persistent);
   seederShared.core.load(settings, persistent);
 
-  app::SeederApp::PoolPart parts[SEEDER_POOL_PART_COUNT];
-  uint32_t total = 0;
-  for (uint8_t i = 0; i < SEEDER_POOL_PART_COUNT; i++) {
-    parts[i] = {SEEDER_POOL_PARTS[i], SEEDER_POOL_PART_SIZES[i]};
-    total += SEEDER_POOL_PART_SIZES[i];
-  }
-  // AgIsoStack scales a pool for another VT size in a RAM copy of all its
-  // parts - 150 kB, more than the free internal heap. Without PSRAM the pool
-  // goes up unscaled (400 px design size), straight from flash.
+  // The seeder scales its pool for the VT in a RAM copy - 160 kB, more than
+  // the free internal heap. Without PSRAM the pool goes up unscaled (400 px
+  // design size), straight from flash.
   const bool scale = heap_caps_get_free_size(MALLOC_CAP_SPIRAM) > 512 * 1024;
   seederApp = std::make_unique<app::SeederApp>(seederShared);
+  // Its AUX-N assignments (our joystick's inputs to its functions)
+  seederApp->set_aux_storage(&storage::load_aux, &storage::save_aux);
   // The joystick's VT partner: AgIsoStack binds an address claim to one
   // partner only, so a second partner for the same VT would never be found.
-  const bool started = seederApp->start(0, parts, SEEDER_POOL_PART_COUNT, SEEDER_POOL_VERSION,
-                                        partnerVT, scale);
+  const bool started = seederApp->start(0, SEEDER_POOL, sizeof(SEEDER_POOL), SEEDER_POOL_PART_SIZES,
+                                        SEEDER_POOL_PART_COUNT, SEEDER_POOL_VERSION, partnerVT, scale);
   debug_log("[SEEDER] %s: pool %lu bytes in %u parts, version %s, settings %s, %s",
-            started ? "started" : "START FAILED", (unsigned long)total,
+            started ? "started" : "START FAILED", (unsigned long)sizeof(SEEDER_POOL),
             (unsigned)SEEDER_POOL_PART_COUNT, SEEDER_POOL_VERSION,
             hadSettings ? "loaded" : "defaults",
             scale ? "scaled to the VT (PSRAM)" : "unscaled (no PSRAM)");
@@ -809,16 +891,60 @@ static void handleOtaRoot() {
   for (uint8_t i = 0; i < NUM_AUX_ANALOG; i++) {
     html += String(analogValues[i]) + " ";
   }
-  html += "</p><p>Buttons: ";
-  for (uint8_t i = 0; i < NUM_AUX_BUTTONS; i++) {
-    html += buttonStates[i] ? "1" : "0";
+  // Bit 0 first: keypad PCA9555, then the brain board's
+  html += "</p><p>Input bits (keypad PCA9555 0-15 | brain board PCA9555 16-31 | ADC low "
+          "32-35): ";
+  for (uint8_t bit = 0; bit < NUM_INPUT_BITS; bit++) {
+    if (bit == MAIN_PCA_FIRST_BIT || bit == ADC_FIRST_BIT)
+      html += " | ";
+    html += (inputBits & (1ull << bit)) ? "1" : "0";
+  }
+  if (settings_layout() == DEVICE_LAYOUT_B) {
+    html += "</p><p>Layout B wiring: ";
+    const uint8_t *bits = button_teach_bits();
+    for (uint8_t i = 0; i < NUM_B_BUTTONS; i++) {
+      html += String(i ? ", " : "") + B_BUTTON_LABELS[i] + "=" +
+              (bits[i] == BUTTON_TEACH_UNWIRED ? String("-") : String(bits[i]));
+    }
+    html += button_teach_active() ? " (teach-in running)"
+                                  : " <form method='post' action='/teach' style='display:inline'>"
+                                    "<button>Teach buttons</button></form>";
   }
   html += "</p><form method='post' action='/can'>CAN frame gap: <input name='gap' type='number' "
           "min='0' max='" + String(MAX_TX_GAP_US) + "' value='" + String(txGapMicros) +
           "'> &micro;s (default " + String(DEFAULT_TX_GAP_US) +
           "; lower is a faster pool upload, if the VT keeps up) <button>Save</button></form>"
-          "</body></html>";
+          "<form method='post' action='/layout'>Layout: <select name='layout'>";
+  for (uint8_t layout = 0; layout < DEVICE_LAYOUT_COUNT; layout++) {
+    static const char *const NAMES[DEVICE_LAYOUT_COUNT] = {
+        "A: Handgrip keypad", "B: 10 round buttons (brain board PCA9555)"};
+    html += "<option value='" + String(layout) + "'" +
+            (layout == settings_layout() ? " selected" : "") + ">" + NAMES[layout] +
+            "</option>";
+  }
+  html += "</select> <button>Save and restart</button></form></body></html>";
   otaServer.send(200, "text/html", html);
+}
+
+// Same as the TEACH soft key on the VT
+static void handleTeach() {
+  button_teach_start();
+  otaServer.sendHeader("Location", "/");
+  otaServer.send(303);
+}
+
+// Same as the VT's Settings dropdown, but applied right away: the layout
+// picks the object pool and AUX inputs at boot.
+static uint32_t restartAt = 0;
+static void handleLayout() {
+  const long layout = otaServer.arg("layout").toInt();
+  if (otaServer.hasArg("layout") && layout >= 0 && layout < DEVICE_LAYOUT_COUNT) {
+    settings_set_layout((uint8_t)layout);
+    debug_log("[SETTINGS] Layout %c from the web page, restarting", (char)('A' + layout));
+    restartAt = millis() + 500; // let the response go out first
+  }
+  otaServer.sendHeader("Location", "/");
+  otaServer.send(303);
 }
 
 // Applies right away (the next frame) and is kept across reboots.
@@ -853,6 +979,7 @@ static void handleDebug() {
          String(vtClient->get_softkey_y_axis_pixels()) + ", data mask " +
          String(vtClient->get_number_x_pixels()) + "x" +
          String(vtClient->get_number_y_pixels()) + "), " +
+         "layout " + String((char)('A' + settings_layout())) + ", " +
          (settings_multi_page() ? "multi" : "single") + "-page pool\n";
   twai_status_info_t twai;
   if (twai_get_status_info(&twai) == ESP_OK) {
@@ -863,6 +990,9 @@ static void handleDebug() {
            String(twai.msgs_to_tx) + ", frame gap " + String(txGapMicros) + " us\n";
   }
   out += "\n";
+#if defined(ENABLE_TRITON_POOL)
+  triton_ws::debug_status(out);
+#endif
 #if defined(ENABLE_SEEDER_COMBO)
   seederDebugStatus(out);
   etp_trace::debug_status(out);
@@ -888,6 +1018,8 @@ static void ota_setup() {
 
   otaServer.on("/", HTTP_GET, handleOtaRoot);
   otaServer.on("/can", HTTP_POST, handleCanSettings);
+  otaServer.on("/layout", HTTP_POST, handleLayout);
+  otaServer.on("/teach", HTTP_POST, handleTeach);
   otaServer.on("/debug", HTTP_GET, handleDebug);
   otaServer.begin();
   ESP2SOTA.begin(&otaServer);
@@ -896,6 +1028,8 @@ static void ota_setup() {
 
 static void ota_loop() {
   otaServer.handleClient();
+  if (restartAt && (int32_t)(millis() - restartAt) >= 0)
+    ESP.restart();
   wifi_update();
 }
 #endif
@@ -931,7 +1065,7 @@ void setup() {
   ads.setDataRate(RATE_ADS1115_860SPS);
   Serial.println("ADS1115 OK");
 
-  detectExtenderPCA9555();
+  detectPCA9555s();
 
   settings_load(); // the page mode picks the object pool
 #if defined(ENABLE_OTA_WEBSERVER)
@@ -946,8 +1080,13 @@ void setup() {
   Serial.println("[AUX-N] ISOBUS stack started, claiming address...");
   lights_setup(vtClient);
   settings_setup(vtClient);
+  if (settings_layout() == DEVICE_LAYOUT_B)
+    button_teach_setup(vtClient);
 #if defined(ENABLE_SEEDER_COMBO)
   seederSetup();
+#endif
+#if defined(ENABLE_TRITON_POOL)
+  triton_ws::setup(partnerVT);
 #endif
 
 #if defined(ENABLE_OTA_WEBSERVER)
@@ -1029,9 +1168,13 @@ void loop() {
   lights_update();
   settings_update();
   aux_buttons_update();
+  button_teach_update();
   syncCommitOnConnect();
 #if defined(ENABLE_SEEDER_COMBO)
   seederLoop();
+#endif
+#if defined(ENABLE_TRITON_POOL)
+  triton_ws::update();
 #endif
 
   uint32_t now = millis();

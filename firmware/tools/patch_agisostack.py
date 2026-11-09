@@ -1,18 +1,16 @@
 """
 PlatformIO pre-build script: patches AgIsoStack's VT client (pinned in
 platformio.ini) where its auxiliary input unit side doesn't follow
-ISO 11783-6:2014 Annex J. Still needed on AgIsoStack main as of 2026-10.
+ISO 11783-6:2014 Annex J. Still needed on AgIsoStack main as of 2026-10-30
+(ee6eba1); the J.7.9 "no status until enabled" and J.7.11 "FFFF disables
+all inputs" patches this script also carried are upstream since #655.
 
-1. J.7.9: an input unit shall not send an Auxiliary Input Type 2 Status
-   message for an input until the VT enabled it (except in learn mode).
-   AgIsoStack sent every input's status once a second regardless.
-2. J.7.11: object ID FFFF in an Auxiliary Input Status Enable command means
-   all inputs (disable only). AgIsoStack answered it "invalid object ID",
-   which a VT may take as the input unit not being available.
-3. J.7.9: a held non-latched Boolean (value 1 = 2) repeats its status every
+1. J.7.9: a held non-latched Boolean (value 1 = 2) repeats its status every
    200 ms; an implement treats it as released after 300 ms without one.
    AgIsoStack only sent changes (and once a second).
-4. Object pools uploaded in several parts: a failed part started the next
+2. J.7.9: an input's status goes out right after the VT enables it, not up
+   to a second later.
+3. Object pools uploaded in several parts: a failed part started the next
    part's transfer, whose result was then lost, and the upload never
    started again.
 
@@ -27,21 +25,6 @@ Import("env")  # noqa: F821 - provided by PlatformIO
 
 PATCHES = [
     (
-        "J.7.9 status only when enabled",
-        """		bool retVal = false;
-		AuxiliaryInputState &state = ourAuxiliaryInputs.at(objectID);
-		/// @todo Change status message every 50ms to every 200ms for non-latched boolean inputs on interaction
-		if (SystemTiming::time_expired_ms(state.lastStatusUpdate, AUXILIARY_INPUT_STATUS_DELAY) ||""",
-        """		bool retVal = false;
-		AuxiliaryInputState &state = ourAuxiliaryInputs.at(objectID);
-		// AgIsoAuxInputs patch: ISO 11783-6 J.7.9 - no status until the VT enabled this input, except in learn mode
-		if ((!state.enabled) && (!get_auxiliary_input_learn_mode_enabled()))
-		{
-			return false;
-		}
-		if (SystemTiming::time_expired_ms(state.lastStatusUpdate, AUXILIARY_INPUT_STATUS_DELAY) ||""",
-    ),
-    (
         "J.7.9 held repeat",
         """			if ((value1 != ourAuxiliaryInputs.at(auxiliaryInputID).value1) || (value2 != ourAuxiliaryInputs.at(auxiliaryInputID).value2))
 			{""",
@@ -54,42 +37,20 @@ PATCHES = [
 			{""",
     ),
     (
-        "J.7.11 disable all",
-        """							std::uint16_t inputObjectID = message.get_uint16_at(1);
-							bool shouldEnable = message.get_bool_at(3, 0);
-""",
-        """							std::uint16_t inputObjectID = message.get_uint16_at(1);
-							bool shouldEnable = message.get_bool_at(3, 0);
-							// AgIsoAuxInputs patch: ISO 11783-6 J.7.11 - FFFF addresses all inputs, and only to disable them
-							if (NULL_OBJECT_ID == inputObjectID)
-							{
-								if (!shouldEnable)
-								{
-									for (auto &input : parentVT->ourAuxiliaryInputs)
-									{
-										input.second.enabled = false;
-									}
-								}
-								parentVT->send_auxiliary_input_status_enable_response(inputObjectID, false, shouldEnable);
-								break;
-							}
-""",
-    ),
-    (
         "J.7.9 status right after enabling",
-        """							if (!isInvalidObjectID)
-							{
-								result->second.enabled = shouldEnable;
-							}""",
-        """							if (!isInvalidObjectID)
-							{
-								// AgIsoAuxInputs patch: send the input's current status right after it's enabled
-								if (shouldEnable && !result->second.enabled)
+        """								if (!isInvalidObjectID)
 								{
-									result->second.lastStatusUpdate = 0;
-								}
-								result->second.enabled = shouldEnable;
-							}""",
+									result->second.enabled = shouldEnable;
+								}""",
+        """								if (!isInvalidObjectID)
+								{
+									// AgIsoAuxInputs patch: send the input's current status right after it's enabled
+									if (shouldEnable && !result->second.enabled)
+									{
+										result->second.lastStatusUpdate = 0;
+									}
+									result->second.enabled = shouldEnable;
+								}""",
     ),
     # Multi-part object pools (several set_object_pool() indexes): after a
     # part failed, the upload loop went on and started the next part while

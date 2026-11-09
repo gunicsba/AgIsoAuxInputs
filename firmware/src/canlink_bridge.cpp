@@ -234,12 +234,23 @@ static void canRxTask(void *) {
   }
 }
 
-static bool busTxErrorPassive() {
+// Error-passive in either direction: with nothing (working) on the bus, the
+// controller either retries one frame unacknowledged (TX errors) or - with a
+// floating or noisy bus line - never gets to send at all, piling up RX errors
+// while the TX counter stays at 0.
+static bool busUnusable() {
   twai_status_info_t status;
   return twai_get_status_info(&status) == ESP_OK &&
          (status.state != TWAI_STATE_RUNNING ||
-          status.tx_error_counter >= TWAI_ERROR_PASSIVE_LIMIT);
+          status.tx_error_counter >= TWAI_ERROR_PASSIVE_LIMIT ||
+          status.rx_error_counter >= TWAI_ERROR_PASSIVE_LIMIT);
 }
+
+// When the TWAI TX queue has refused every frame for this long, the bus
+// isn't taking frames, whatever its error counters say.
+static constexpr uint32_t BUS_TX_STUCK_MS = 250;
+// (Written by the loop task, read by the TCP task.)
+static volatile uint32_t busTxRefusedSinceMs = 0; // 0 = the last write went into the TX queue
 
 void BridgedTWAIPlugin::open() {
   isobus::TWAIPlugin::open();
@@ -268,12 +279,17 @@ bool BridgedTWAIPlugin::write_frame(const isobus::CANMessageFrame &canFrame) {
   message.data_length_code = canFrame.dataLength;
   memcpy(message.data, canFrame.data, canFrame.dataLength);
 
-  if (twai_transmit(&message, 0) != ESP_OK) {
+  if (twai_transmit(&message, 0) == ESP_OK) {
+    busTxRefusedSinceMs = 0;
+  } else {
     // Without another node to ACK, the controller sits error-passive retrying
     // one frame forever. If the tablet is the real receiver, give it the frame
     // anyway; otherwise it stays queued in the stack and is retried on the
     // next update(), as with TWAIPlugin's zero timeout.
-    if (activeTcpGeneration == 0 || !busTxErrorPassive()) return false;
+    const uint32_t now = millis();
+    if (busTxRefusedSinceMs == 0) busTxRefusedSinceMs = now | 1;
+    const bool stuck = now - busTxRefusedSinceMs >= BUS_TX_STUCK_MS;
+    if (activeTcpGeneration == 0 || !(stuck || busUnusable())) return false;
     ++busTxFailCount;
   }
   if (canFrame.isExtendedFrame)
@@ -597,7 +613,8 @@ static void handleTabletCanFrame(uint32_t canId, const uint8_t *data, uint8_t dl
   message.extd = 1;
   message.data_length_code = dlc;
   memcpy(message.data, data, dlc);
-  const TickType_t timeout = busTxErrorPassive() ? 0 : TABLET_TO_BUS_TIMEOUT;
+  const TickType_t timeout =
+      (busTxRefusedSinceMs != 0 || busUnusable()) ? 0 : TABLET_TO_BUS_TIMEOUT;
   if (twai_transmit(&message, timeout) != ESP_OK) ++busTxFailCount;
 }
 

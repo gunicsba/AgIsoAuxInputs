@@ -19,6 +19,12 @@ static constexpr uint8_t AUX_POINTER_ATTRIBUTE_OBJECT_ID = 2;
 static std::shared_ptr<isobus::VirtualTerminalClient> vt;
 static std::shared_ptr<isobus::InternalControlFunction> ecu;
 static bool multi = false;
+static uint8_t layout = DEVICE_LAYOUT_A;
+// The layout's buttons: bit n of the reported bits is input buttonIds[n]
+static const uint16_t *buttonIds = AUX_BUTTON_IDS;
+static uint8_t buttonCount = NUM_AUX_BUTTONS;
+static uint16_t buttonsOnScreen = JOY_BUTTONS_ON_SCREEN;
+static uint16_t latchingMask = 0; // single mode: bit n = input n is a latched Boolean
 
 // --- AUX-N input objects -----------------------------------------------------
 
@@ -61,6 +67,19 @@ static void sendInput(AuxInput &input, bool pressed, bool forceResync) {
   if (!changed && !forceResync && state != AUX_HELD)
     return;
   vt->update_auxiliary_input(input.objectId, state, input.transitions);
+}
+
+// A latching switch (function type 0, Boolean latched, Table J.5): value 1 is
+// 1 while on, 0 while off - no held state, so no 200 ms repeat; value 2
+// counts off -> on transitions.
+static void sendLatched(AuxInput &input, bool on, bool forceResync) {
+  const uint8_t state = on ? AUX_PRESSED : AUX_RELEASED;
+  if (on && input.state == AUX_RELEASED)
+    input.transitions++;
+  const bool changed = state != input.state;
+  input.state = state;
+  if (changed || forceResync)
+    vt->update_auxiliary_input(input.objectId, state, input.transitions);
 }
 
 // --- Assignment tracking -----------------------------------------------------
@@ -284,15 +303,20 @@ static bool isPageSelectBit(uint8_t bit, uint8_t *page) {
   return false;
 }
 
+// A button's colour in the pool as uploaded
+static uint8_t buttonPoolColour(uint8_t bit) {
+  return layout == DEVICE_LAYOUT_B ? B_BUTTON_COLOURS[bit] : COLOUR_RELEASED;
+}
+
 static uint8_t buttonBaseColour(uint8_t bit) {
   uint8_t page;
   if (multi && isPageSelectBit(bit, &page) && page == currentPage)
     return COLOUR_ACTIVE_PAGE;
-  return COLOUR_RELEASED;
+  return buttonPoolColour(bit);
 }
 
 static void setButtonFill(uint8_t bit, uint8_t colour) {
-  if (!(JOY_BUTTONS_ON_SCREEN & (1u << bit)) || !vt->get_is_connected())
+  if (!(buttonsOnScreen & (1u << bit)) || !vt->get_is_connected())
     return;
   vt->send_change_fill_attributes(
       JOY_BUTTON_FILL_BASE + bit,
@@ -305,10 +329,17 @@ static void setButtonFill(uint8_t bit, uint8_t colour) {
 
 void aux_buttons_setup(std::shared_ptr<isobus::VirtualTerminalClient> vtClient,
                        std::shared_ptr<isobus::InternalControlFunction> internalEcu,
-                       bool multiPage) {
+                       bool multiPage, uint8_t deviceLayout, uint16_t latchingButtons) {
   vt = vtClient;
   ecu = internalEcu;
-  multi = multiPage;
+  layout = deviceLayout;
+  multi = multiPage && layout == DEVICE_LAYOUT_A;
+  if (layout == DEVICE_LAYOUT_B) {
+    buttonIds = B_BUTTON_IDS;
+    buttonCount = NUM_B_BUTTONS;
+    buttonsOnScreen = (1u << NUM_B_BUTTONS) - 1;
+    latchingMask = latchingButtons;
+  }
 
   if (multi) {
     uint16_t pagedBits = 0;
@@ -323,13 +354,13 @@ void aux_buttons_setup(std::shared_ptr<isobus::VirtualTerminalClient> vtClient,
         inputs[inputCount++] = {AUX_BUTTON_IDS[i], AUX_RELEASED, 0, 0};
     }
   } else {
-    for (uint8_t i = 0; i < NUM_AUX_BUTTONS; i++)
-      inputs[inputCount++] = {AUX_BUTTON_IDS[i], AUX_RELEASED, 0, 0};
+    for (uint8_t i = 0; i < buttonCount; i++)
+      inputs[inputCount++] = {buttonIds[i], AUX_RELEASED, 0, 0};
   }
   for (size_t i = 0; i < inputCount; i++)
     vt->add_auxiliary_input_object_id(inputs[i].objectId);
-  vt->set_auxiliary_input_model_identification_code(multi ? MODEL_ID_MULTI
-                                                          : MODEL_ID_SINGLE);
+  vt->set_auxiliary_input_model_identification_code(
+      layout == DEVICE_LAYOUT_B ? MODEL_ID_B : multi ? MODEL_ID_MULTI : MODEL_ID_SINGLE);
 
   memset(inputUnitStatus, 0xFF, sizeof(inputUnitStatus));
   isobus::CANHardwareInterface::get_can_frame_received_event_dispatcher()
@@ -367,8 +398,12 @@ void aux_buttons_report(uint16_t pressedBits, bool forceResync) {
     while (n < inputCount)
       sendInput(inputs[n++], false, forceResync);
   } else {
-    for (uint8_t i = 0; i < NUM_AUX_BUTTONS; i++)
-      sendInput(inputs[i], pressedBits & (1u << i), forceResync);
+    for (uint8_t i = 0; i < buttonCount; i++) {
+      if (latchingMask & (1u << i))
+        sendLatched(inputs[i], pressedBits & (1u << i), forceResync);
+      else
+        sendInput(inputs[i], pressedBits & (1u << i), forceResync);
+    }
   }
 
   for (uint8_t bit = 0; bit < 16; bit++) {
@@ -387,7 +422,7 @@ void aux_buttons_update() {
     screenDirty = true;
     for (uint8_t bit = 0; bit < 16; bit++) {
       bool pressed = lastPressedBits & (1u << bit);
-      if (pressed || buttonBaseColour(bit) != COLOUR_RELEASED)
+      if (pressed || buttonBaseColour(bit) != buttonPoolColour(bit))
         setButtonFill(bit, pressed ? COLOUR_PRESSED : buttonBaseColour(bit));
     }
   }

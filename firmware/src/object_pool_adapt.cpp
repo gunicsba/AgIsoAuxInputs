@@ -7,8 +7,8 @@
 
 static constexpr uint8_t FONT_SIZE_COUNT = sizeof(AUX_POOL_FONT_SIZES) / sizeof(AUX_POOL_FONT_SIZES[0]);
 
-const AuxPoolLayout &aux_pool_layout(bool multiPage, uint16_t maskSize) {
-  return AUX_N_POOL_LAYOUTS[multiPage ? 1 : 0][maskSize < AUX_POOL_COMPACT_BELOW_MASK ? 1 : 0];
+const AuxPoolLayout &aux_pool_layout(uint8_t pool, uint16_t maskSize) {
+  return AUX_N_POOL_LAYOUTS[pool][maskSize < AUX_POOL_COMPACT_BELOW_MASK ? 1 : 0];
 }
 
 // The largest supported font that fits width x height (ISO 11783-6 4.6.16.3:

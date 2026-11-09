@@ -68,3 +68,34 @@ static const uint16_t PAGED_AUX_IDS[NUM_PAGED_BUTTONS][PAGED_LAYERS] = {
 };
 // PCA9555 bits of T1..T4, which select page 1..4 in multi mode
 static const uint8_t PAGE_SELECT_BITS[NUM_PAGES] = {13, 12, 11, 10};
+
+// Device layouts: the Settings dropdown's value is the layout index
+#define DEVICE_LAYOUT_COUNT 2
+#define DEVICE_LAYOUT_A 0
+#define DEVICE_LAYOUT_B 1
+#define INPUT_LAYOUT 81
+
+// Layout B: round buttons (fill JOY_BUTTON_FILL_BASE + index), single-page only
+#define MODEL_ID_B 3
+#define NUM_B_BUTTONS 10
+static const uint16_t B_BUTTON_IDS[NUM_B_BUTTONS] = {220, 221, 222, 223, 224, 225, 226, 227, 228, 229};
+// Input bit of each button: 0-15 a keypad PCA9555, 16-31 the brain board's
+static const uint8_t B_BUTTON_INPUT_BITS[NUM_B_BUTTONS] = {16, 17, 18, 19, 20, 21, 22, 23, 24, 25};
+// Teach-in (layout B)
+#define KEY_TEACH 86
+#define TEACH_SOFT_KEY_MASK 88
+#define KEY_TEACH_SKIP 89
+#define KEY_TEACH_CANCEL 91
+#define MAIN_SOFT_KEY_MASK 7
+#define STR_MAIN_TITLE 50
+#define TITLE_TEXT_LENGTH 16
+#define MAIN_TITLE_TEXT "AgIsoAuxInputs"
+static const char *const B_BUTTON_LABELS[NUM_B_BUTTONS] = {"Y1", "R1", "G1", "Y2", "R2", "G2", "B1", "W1", "W2", "B2"};
+// INPUTS page (layout B): momentary or latching per button
+#define INPUTS_MASK 93
+#define KEY_INPUTS 95
+#define BTN_INPUT_TYPE_BASE 240
+#define STR_INPUT_TYPE_BASE 250
+#define INPUT_TYPE_TEXT_LENGTH 13
+// VT palette colour of each button when released
+static const uint8_t B_BUTTON_COLOURS[NUM_B_BUTTONS] = {14, 12, 2, 14, 12, 2, 9, 7, 7, 9};

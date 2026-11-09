@@ -77,7 +77,27 @@ The joystick learns what's assigned by reading the VT's assignment commands to t
 
 The main screen also has an AUX designator pointer per button, so the VT can draw the assigned function's icon in it. It's turned off for now (`SHOW_AUX_POINTERS` in `build_aux_pool.py`) while a hang in AgIsoVirtualTerminal's AUX-N build is investigated ([AgIsoVirtualTerminal#252](https://github.com/Open-Agriculture/AgIsoVirtualTerminal/issues/252)).
 
-The brain board's own PCA9555 and the optocoupler output are not used by this firmware yet.
+#### Layouts
+
+The **LAYOUT** dropdown on the Settings page (or the **Layout** dropdown on the board's web page, which restarts the board right away) picks the device:
+
+- **A**: the Handgrip keypad above, on a PCA9555 at 0x21-0x23.
+- **B**: a grip with 10 round buttons (two yellow, two red, two green, two blue, two white) wired to the brain board's own PCA9555 (0x20). The main screen draws them as circles in their own colours (lime while pressed), labelled `Y1`, `R1`, `G1`, `Y2`, `R2`, `G2`, `B1`, `W1`, `W2`, `B2` from top to bottom. These labels are also the AUX input designators. This grip has no LEDs, so the light soft keys, page colours and press flash are hidden, and it runs single-page only. Its 10 buttons are its only inputs: no analog `A1`-`A4`. They are their own set, with their own NAME (identity number 4) and model identification code.
+
+  Each button can be **momentary** (a push button: AUX-N type 2, non-latching Boolean) or **latching** (a latching switch: AUX-N type 0, latched Boolean, on while the switch is down). Set this per button on the **INPUTS** page (Settings, then the **INPUTS** soft key). The input type is part of the object pool, so a change applies after **RESTART**.
+
+Like the page mode, a new layout applies after a restart.
+
+Layout B learns its wiring with a **teach-in**. Press the **TEACH** soft key on the main screen, or **Teach buttons** on the board's web page. The VT then shows the button to press in black, with `PRESS Y1` in the title, and moves to the next button as soon as an input is pressed that no earlier button took. **SKIP** leaves a button unwired; **CANCEL** keeps the previous wiring. No AUX input status goes out while teaching, so the presses can't move an implement. The result is kept across power cycles and shown on the web page.
+
+A button can be wired to any of these inputs:
+- a pin of the keypad PCA9555 (input bits 0-15);
+- a pin of the brain board's PCA9555 (bits 16-31);
+- an ADS1115 channel (bits 32-35). A button on an ADS1115 channel counts as pressed when it pulls the channel below about 4% of full scale, and released again above about 8%.
+
+At boot the firmware logs every I2C device to `/debug`, and it logs every input change, for example `[BTN] input bit 18 (PCA9555 0x20 bit 2) pressed`.
+
+The optocoupler output is not used by this firmware yet.
 
 ## Flash a release
 

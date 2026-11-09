@@ -98,6 +98,16 @@ def parse(data):
         elif typ == b.TYPE_OUTPUT_RECTANGLE:
             o["w"], o["h"] = struct.unpack_from("<HH", data, i + 5)
             size = 13
+        elif typ == b.TYPE_OUTPUT_ELLIPSE:
+            o["w"], o["h"] = struct.unpack_from("<HH", data, i + 5)
+            size = 15
+        elif typ == b.TYPE_INPUT_LIST:
+            o["w"], o["h"] = struct.unpack_from("<HH", data, i + 3)
+            n = data[i + 10]
+            # Items are drawn at the list's top left
+            o["children"] = [(struct.unpack_from("<H", data, i + 13 + 2 * k)[0], 0, 0)
+                             for k in range(n)]
+            size = 13 + 2 * n
         elif typ == b.TYPE_FONT_ATTRIBUTES:
             o["size"] = data[i + 4]
             size = 8
@@ -143,7 +153,7 @@ def check(objs, mask, kw, kh, where):
             inside(oid, mask, mask)
         elif t in (b.TYPE_KEY, b.TYPE_AUXILIARY_INPUT_TYPE_2, b.TYPE_WORKING_SET):
             inside(oid, kw, kh)
-        elif t == b.TYPE_BUTTON:
+        elif t in (b.TYPE_BUTTON, b.TYPE_INPUT_LIST):
             inside(oid, o["w"], o["h"])
         text_fits(oid, o)
     return problems
@@ -151,14 +161,14 @@ def check(objs, mask, kw, kh, where):
 
 def main():
     failed = False
-    for multi in (False, True):
-        pools = b.build_layouts(multi)
+    for kind in b.POOLS:
+        pools = b.build_layouts(kind)
         for name, mask, kw, kh in PROFILES:
             layout_index = 1 if mask < b.COMPACT_BELOW_MASK else 0
             layout, pool = b.LAYOUTS[layout_index], pools[layout_index]
             data, shape, sx, sy = scale(pool, layout, mask, kw, kh)
             objs = parse(data)
-            where = f"{'multi' if multi else 'single'} {name}"
+            where = f"{kind} {name}"
             problems = check(objs, mask, kw, kh, where)
             fonts = {fid: b.FONT_SIZES[objs[fid]["size"]] for fid in
                      (b.TEST_FONT, b.MASK_TITLE_FONT, b.MASK_SMALL_FONT, b.KEY_FONT,

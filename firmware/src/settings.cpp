@@ -23,17 +23,23 @@ struct DeviceSettings {
   uint8_t multiPage;
   uint8_t pageColour[NUM_PAGES]; // index into PRESETS
   uint8_t pressFlash;
+  uint8_t layout; // DEVICE_LAYOUT_A/B (added later: older saves lack it)
 };
+static constexpr size_t SETTINGS_SIZE_WITHOUT_LAYOUT = offsetof(DeviceSettings, layout);
 
 static Preferences prefs;
 static std::shared_ptr<isobus::VirtualTerminalClient> vt;
-static DeviceSettings settings = {0, {0, 1, 2, 3}, 1};
+static DeviceSettings settings = {0, {0, 1, 2, 3}, 1, DEVICE_LAYOUT_A};
 static bool activeMultiPage = false; // what this boot runs
+static uint8_t activeLayout = DEVICE_LAYOUT_A;
 static bool dirty = false;
 static uint32_t changedAt = 0;
 static uint32_t restartAt = 0;
 static bool vtWasConnected = false;
 static bool vtSynced = false;
+// Layout B's latching buttons (bit n = button n), saved and this boot's
+static uint16_t latching = 0;
+static uint16_t activeLatching = 0;
 
 // Pads to the pool string's length so the VT has room for every variant.
 static bool sendPadded(uint16_t objectId, int length, const char *text) {
@@ -42,8 +48,13 @@ static bool sendPadded(uint16_t objectId, int length, const char *text) {
   return vt->send_change_string_value(objectId, buffer);
 }
 
+// The page mode button and the "restart to apply" hint under it, which
+// also covers a changed layout
 static bool sendPageMode() {
-  bool pending = (bool)settings.multiPage != activeMultiPage;
+  const bool pending = settings.layout != activeLayout ||
+                       (activeLayout == DEVICE_LAYOUT_A &&
+                        (bool)settings.multiPage != activeMultiPage) ||
+                       (activeLayout == DEVICE_LAYOUT_B && latching != activeLatching);
   return sendPadded(STR_PAGE_MODE, PAGE_MODE_TEXT_LENGTH,
                     settings.multiPage ? "PAGES: MULTI" : "PAGES: SINGLE") &&
          sendPadded(STR_RESTART_HINT, RESTART_HINT_TEXT_LENGTH,
@@ -57,6 +68,13 @@ static bool sendPageColour(uint8_t page) {
   return sendPadded(STR_PAGE_COLOUR_BASE + page, PAGE_COLOUR_TEXT_LENGTH, text);
 }
 
+static bool sendInputType(uint8_t button) {
+  char text[24];
+  snprintf(text, sizeof(text), "%s: %s", B_BUTTON_LABELS[button],
+           (latching & (1u << button)) ? "LATCHING" : "MOMENTARY");
+  return sendPadded(STR_INPUT_TYPE_BASE + button, INPUT_TYPE_TEXT_LENGTH, text);
+}
+
 static bool sendPressFlash() {
   return sendPadded(STR_PRESS_FLASH, PRESS_FLASH_TEXT_LENGTH,
                     settings.pressFlash ? "PRESS FLASH: ON" : "PRESS FLASH: OFF");
@@ -65,14 +83,16 @@ static bool sendPressFlash() {
 static void markChanged() {
   dirty = true;
   changedAt = millis();
-  Serial.printf("[SETTINGS] pages=%s colours=%u,%u,%u,%u flash=%u\n",
-                settings.multiPage ? "multi" : "single", settings.pageColour[0],
+  Serial.printf("[SETTINGS] layout=%c pages=%s colours=%u,%u,%u,%u flash=%u\n",
+                'A' + settings.layout, settings.multiPage ? "multi" : "single",
+                settings.pageColour[0],
                 settings.pageColour[1], settings.pageColour[2],
                 settings.pageColour[3], settings.pressFlash);
 }
 
 static void save() {
   prefs.putBytes("settings", &settings, sizeof(settings));
+  prefs.putUShort("bLatch", latching);
   dirty = false;
 }
 
@@ -83,6 +103,15 @@ static void onKeyOrButton(const isobus::VirtualTerminalClient::VTKeyEvent &event
 
   if (event.objectID == KEY_SETTINGS) {
     vt->send_change_active_mask(WORKING_SET, SETTINGS_MASK);
+  } else if (event.objectID == KEY_INPUTS) {
+    vt->send_change_active_mask(WORKING_SET, INPUTS_MASK);
+  } else if (activeLayout == DEVICE_LAYOUT_B && event.objectID >= BTN_INPUT_TYPE_BASE &&
+             event.objectID < BTN_INPUT_TYPE_BASE + NUM_B_BUTTONS) {
+    const uint8_t button = event.objectID - BTN_INPUT_TYPE_BASE;
+    latching ^= 1u << button;
+    sendInputType(button);
+    sendPageMode(); // the restart hint
+    markChanged();
   } else if (event.objectID == BTN_PAGE_MODE) {
     settings.multiPage = !settings.multiPage;
     sendPageMode();
@@ -104,20 +133,47 @@ static void onKeyOrButton(const isobus::VirtualTerminalClient::VTKeyEvent &event
   }
 }
 
+// The layout dropdown on the Settings page
+static void onNumericValue(const isobus::VirtualTerminalClient::VTChangeNumericValueEvent &event) {
+  if (event.objectID != INPUT_LAYOUT || event.value >= DEVICE_LAYOUT_COUNT)
+    return;
+  settings.layout = event.value;
+  sendPageMode();
+  markChanged();
+}
+
 void settings_load() {
   prefs.begin("settings", false);
-  DeviceSettings stored;
-  if (prefs.getBytes("settings", &stored, sizeof(stored)) == sizeof(stored)) {
-    bool valid = stored.multiPage <= 1 && stored.pressFlash <= 1;
+  DeviceSettings stored = settings;
+  const size_t length = prefs.getBytesLength("settings");
+  if ((length == sizeof(stored) || length == SETTINGS_SIZE_WITHOUT_LAYOUT) &&
+      prefs.getBytes("settings", &stored, length) == length) {
+    bool valid = stored.multiPage <= 1 && stored.pressFlash <= 1 &&
+                 stored.layout < DEVICE_LAYOUT_COUNT;
     for (uint8_t p = 0; p < NUM_PAGES; p++)
       valid &= stored.pageColour[p] < NUM_PRESETS;
     if (valid)
       settings = stored;
   }
-  activeMultiPage = settings.multiPage;
+  activeLayout = settings.layout;
+  activeMultiPage = settings.multiPage && activeLayout == DEVICE_LAYOUT_A;
+  latching = prefs.getUShort("bLatch", 0) & ((1u << NUM_B_BUTTONS) - 1);
+  activeLatching = latching;
 }
 
+uint16_t settings_b_latching() { return activeLayout == DEVICE_LAYOUT_B ? activeLatching : 0; }
+
 bool settings_multi_page() { return activeMultiPage; }
+
+uint8_t settings_layout() { return activeLayout; }
+
+void settings_set_layout(uint8_t layout) {
+  if (layout >= DEVICE_LAYOUT_COUNT)
+    return;
+  settings.layout = layout;
+  save();
+  vtSynced = false; // the dropdown and hint, if a VT is connected
+}
 
 uint32_t settings_page_colour(uint8_t page) {
   return PRESETS[settings.pageColour[page % NUM_PAGES]].rgb;
@@ -129,6 +185,7 @@ void settings_setup(std::shared_ptr<isobus::VirtualTerminalClient> vtClient) {
   vt = vtClient;
   vt->get_vt_soft_key_event_dispatcher().add_listener(onKeyOrButton);
   vt->get_vt_button_event_dispatcher().add_listener(onKeyOrButton);
+  vt->get_vt_change_numeric_value_event_dispatcher().add_listener(onNumericValue);
 }
 
 void settings_update() {
@@ -138,9 +195,14 @@ void settings_update() {
     vtSynced = false;
   vtWasConnected = connected;
   if (connected && !vtSynced) {
-    bool ok = sendPageMode() && sendPressFlash();
+    // The pool's dropdown shows this boot's layout; a saved other one
+    // (pending restart) is set here
+    bool ok = sendPageMode() && sendPressFlash() &&
+              vt->send_change_numeric_value(INPUT_LAYOUT, settings.layout);
     for (uint8_t p = 0; p < NUM_PAGES; p++)
       ok &= sendPageColour(p);
+    for (uint8_t i = 0; i < NUM_B_BUTTONS && activeLayout == DEVICE_LAYOUT_B; i++)
+      ok &= sendInputType(i);
     vtSynced = ok; // retried next loop if the TX queue was full
   }
 

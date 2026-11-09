@@ -22,9 +22,9 @@ struct VtDisplay {
   uint16_t fontsSupported; // bit n = ISO font size n (6x8 = bit 0) is supported
 };
 
-// The full layout, or the compact one for a data mask below
-// AUX_POOL_COMPACT_BELOW_MASK. Both layouts of a mode have the same size.
-const AuxPoolLayout &aux_pool_layout(bool multiPage, uint16_t maskSize);
+// The pool's (AuxPool) full layout, or its compact one for a data mask below
+// AUX_POOL_COMPACT_BELOW_MASK. Both layouts of a pool have the same size.
+const AuxPoolLayout &aux_pool_layout(uint8_t pool, uint16_t maskSize);
 
 // Copies the layout into buffer and adapts it to the VT: scaled to its data
 // mask and soft key designator, then VT4 justification or VT2 AUX-N

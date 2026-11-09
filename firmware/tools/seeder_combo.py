@@ -6,9 +6,9 @@ custom_seeder_dir in platformio.ini).
 - Exports SEEDER_DIR, so src/CMakeLists.txt compiles the seeder's core and
   ISOBUS app (VT UI, TC client) into this firmware.
 - Splits the seeder's generated object pool at object boundaries into
-  custom_seeder_pool_parts parts of about equal size and writes them to
-  src/object_pool/seeder_pool_parts.h as C arrays (and each part as
-  seeder_pool_part_<n>.iop next to it). The VT client uploads
+  custom_seeder_pool_parts parts of about equal size and writes the pool
+  and the part sizes to src/object_pool/seeder_pool_parts.h as C arrays
+  (and each part as seeder_pool_part_<n>.iop next to it). The VT client uploads
   each part as its own Object Pool Transfer, then one End of Object Pool -
   to test VTs on chunked uploads.
 
@@ -56,6 +56,11 @@ OBJECT_LAYOUTS = {
     26: (6, [("len1", 4), ("n2", 5)]),            # Input Attributes
     27: (5, []),                                  # Object Pointer
     28: (5, [("len2", 3)]),                       # Macro
+    29: (6, [("n6", 5)]),                         # Auxiliary Function Type 1
+    30: (7, [("n6", 6)]),                         # Auxiliary Input Type 1
+    31: (6, [("n6", 5)]),                         # Auxiliary Function Type 2
+    32: (6, [("n6", 5)]),                         # Auxiliary Input Type 2
+    33: (6, []),                                  # Auxiliary Control Designator Type 2 Object Pointer
 }
 COUNT_SIZES = {"n6": 6, "n2": 2, "n4": 4}
 
@@ -128,15 +133,14 @@ def write_header(path, chunks, label, source):
         f"#define SEEDER_POOL_PART_COUNT {len(chunks)}",
         "",
     ]
-    for i, chunk in enumerate(chunks):
-        lines.append(f"static const uint8_t SEEDER_POOL_PART_{i}[{len(chunk)}] = {{")
-        for row in range(0, len(chunk), 24):
-            lines.append("  " + ",".join(str(b) for b in chunk[row:row + 24]) + ",")
-        lines.append("};")
-    lines.append("")
-    lines.append("static const uint8_t *const SEEDER_POOL_PARTS[SEEDER_POOL_PART_COUNT] = {")
-    lines.append("  " + ", ".join(f"SEEDER_POOL_PART_{i}" for i in range(len(chunks))) + ",")
+    # One array: the seeder scales the whole pool (its scale map has
+    # pool-wide offsets) and serves each part from it
+    pool = b"".join(chunks)
+    lines.append(f"static const uint8_t SEEDER_POOL[{len(pool)}] = {{")
+    for row in range(0, len(pool), 24):
+        lines.append("  " + ",".join(str(b) for b in pool[row:row + 24]) + ",")
     lines.append("};")
+    lines.append("")
     lines.append("static const uint32_t SEEDER_POOL_PART_SIZES[SEEDER_POOL_PART_COUNT] = {")
     lines.append("  " + ", ".join(str(len(c)) for c in chunks) + ",")
     lines.append("};")

@@ -11,8 +11,14 @@
 # target_add_binary_data()/board_build.embed_files - both turned out to be
 # fragile (mis-pathed / silently not firing) under this mixed
 # arduino+espidf build, so the array is far simpler and just works.
-set(APP_SRCS "aux_buttons.cpp" "lights.cpp" "main.cpp" "settings.cpp" "debug_log.cpp" "canlink_bridge.cpp" "wifi_setup.cpp" "object_pool_adapt.cpp")
+set(APP_SRCS "aux_buttons.cpp" "lights.cpp" "main.cpp" "settings.cpp" "debug_log.cpp" "canlink_bridge.cpp" "wifi_setup.cpp" "object_pool_adapt.cpp" "triton_ws.cpp" "button_teach.cpp")
 set(APP_INCLUDES ".")
+
+# joystick_seeder: Triton's object IDs for triton_ws.cpp (TRITON_CORE_DIR is
+# set by tools/triton_pool.py)
+if(DEFINED ENV{TRITON_CORE_DIR})
+  list(APPEND APP_INCLUDES "$ENV{TRITON_CORE_DIR}")
+endif()
 
 # joystick_seeder: the seeder controller's core and ISOBUS app as a second
 # working set (SEEDER_DIR is set by tools/seeder_combo.py). Its own ESP
@@ -21,8 +27,11 @@ if(DEFINED ENV{SEEDER_DIR})
   set(SEEDER_DIR "$ENV{SEEDER_DIR}")
   file(GLOB SEEDER_CORE_SRCS "${SEEDER_DIR}/src/core/*.cpp")
   list(APPEND APP_SRCS ${SEEDER_CORE_SRCS}
+       "${SEEDER_DIR}/src/app/aux_n.cpp"
+       "${SEEDER_DIR}/src/app/pool_scaler.cpp"
        "${SEEDER_DIR}/src/app/seeder_app.cpp"
        "${SEEDER_DIR}/src/app/tc_link.cpp"
+       "${SEEDER_DIR}/src/app/vt_sink.cpp"
        "${SEEDER_DIR}/src/app/vt_ui.cpp"
        "${SEEDER_DIR}/src/esp/storage.cpp")
   list(APPEND APP_INCLUDES "${SEEDER_DIR}/include" "${SEEDER_DIR}/src/app" "${SEEDER_DIR}/src/esp")
