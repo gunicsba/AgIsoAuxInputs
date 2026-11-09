@@ -110,7 +110,7 @@ static void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
       staConnectedSinceMs = millis();
       debug_log("[WIFI] Joined '%s': %s ch %u %d dBm, http://%s.local/", staSsid.c_str(),
-                WiFi.localIP().toString().c_str(), WiFi.channel(), WiFi.RSSI(),
+                WiFi.localIP().toString().c_str(), (unsigned)WiFi.channel(), (int)WiFi.RSSI(),
                 hostname.c_str());
       if (apSubnetClash())
         debug_log("[WIFI] WARNING: network overlaps the access point's subnet");

@@ -1,23 +1,33 @@
 /*
  * Wi-Fi/CAN bridge speaking the Proemion CANlink Byte Command Protocol over
- * TCP port 30000, like a CANlink WiFi gateway.
+ * TCP ports 30000-30003, like a CANlink WiFi gateway.
  *
  * Any CANlink client (e.g. AgIsoVirtualTerminal with AgIsoStack's CANlink
  * plugin) can join the bus through it and act as the VT for this AUX-N
  * device without other CAN hardware.
+ *
+ * Each port takes one client, so several apps on one tablet (a VT and a TC,
+ * say) share the bridge: each uses its own port, and a new connection only
+ * replaces the previous one on the same port (an app reconnecting after a
+ * Wi-Fi drop). Only port 30000 is announced over mDNS. Like the CANlink
+ * wireless 4000's MultiTalk mode (object 0x3008:0x04, default on here), a
+ * client's frames also go to the other clients; with it off (MultiPoint)
+ * they only go to the bus and our stack.
  *
  * The ESP32-S3 has a single TWAI controller and AgIsoStack's TWAIPlugin
  * normally owns twai_receive(), so a second reader would steal frames from
  * the stack. Instead BridgedTWAIPlugin replaces TWAIPlugin and becomes the
  * only path to the controller:
  *
- *   bus RX          -> ISOBUS stack + tablet
- *   stack TX        -> bus + tablet
- *   tablet TX       -> bus + ISOBUS stack (TWAI never receives its own
- *                      transmissions, so the local loop has to be explicit)
+ *   bus RX          -> ISOBUS stack + all clients
+ *   stack TX        -> bus + all clients
+ *   client TX       -> bus + ISOBUS stack + other clients (TWAI never
+ *                      receives its own transmissions, so the local loop
+ *                      has to be explicit)
  *
- * With only the tablet connected (nothing else on the bus), bus transmits get
- * no ACK. Frames are still delivered to the tablet in that case, so the whole
+ * With only tablet clients connected (nothing else on the bus), bus
+ * transmits get no ACK. Frames are still delivered to the clients in that
+ * case, so the whole
  * VT session (address claim, pool upload, aux assignment) works standalone.
  */
 #pragma once
@@ -46,8 +56,8 @@ public:
 // is joystick-auxn.local (all three can be changed on the /wifi page).
 WifiSettings wifi_settings();
 
-// Starts the TCP server task and announces it over mDNS (_canlink._tcp, port
-// 30000). Call after wifi_setup() and CANHardwareInterface::start().
+// Starts the TCP servers (ports 30000-30003) and announces port 30000 over
+// mDNS (_canlink._tcp). Call after wifi_setup() and CANHardwareInterface::start().
 void begin();
 
 // True while bus/tablet frames are waiting to be handed to the stack; the
