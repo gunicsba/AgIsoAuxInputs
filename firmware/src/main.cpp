@@ -598,6 +598,21 @@ static bool onAddressClaimRequest(std::uint32_t, std::shared_ptr<isobus::Control
   return true;
 }
 
+// No VT online: request address claims, so a running VT can become the partner.
+static constexpr uint32_t VT_SEARCH_INTERVAL_MS = 10000;
+static uint32_t lastVtSearch = 0;
+
+static void searchForVt() {
+  const uint32_t now = millis();
+  if (partnerVT->get_address_valid() || !internalECU->get_address_valid() ||
+      now - lastVtSearch < VT_SEARCH_INTERVAL_MS)
+    return;
+  lastVtSearch = now;
+  isobus::ParameterGroupNumberRequestProtocol::request_parameter_group_number(
+      static_cast<std::uint32_t>(isobus::CANLibParameterGroupNumber::AddressClaim), internalECU,
+      nullptr);
+}
+
 // Layout B: the pools ship every button momentary; the INPUTS page's
 // latching ones become latched Booleans (ISO 11783-6 Table J.5 type 0). Only
 // where the object still is an Auxiliary Input Type 2 (a VT2 gets them
@@ -981,6 +996,13 @@ static void handleDebug() {
          String(vtClient->get_number_y_pixels()) + "), " +
          "layout " + String((char)('A' + settings_layout())) + ", " +
          (settings_multi_page() ? "multi" : "single") + "-page pool\n";
+  const uint64_t vtName = partnerVT->get_NAME().get_full_name();
+  char vtNameText[17];
+  snprintf(vtNameText, sizeof(vtNameText), "%016llx", (unsigned long long)vtName);
+  out += "  VT partner " + String(vtName == 0 ? "none seen yet" : vtNameText) + ", " +
+         (partnerVT->get_address_valid() ? "at address " + String(partnerVT->get_address())
+                                         : String("offline")) +
+         "\n";
   twai_status_info_t twai;
   if (twai_get_status_info(&twai) == ESP_OK) {
     static const char *stateNames[] = {"STOPPED", "RUNNING", "BUS_OFF", "RECOVERING"};
@@ -1164,6 +1186,7 @@ void loop() {
   }
   recoverFromBusOff();
   adaptPoolToVt();
+  searchForVt();
   vtClient->update();
   lights_update();
   settings_update();

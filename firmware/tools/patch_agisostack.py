@@ -13,6 +13,7 @@ all inputs" patches this script also carried are upstream since #655.
 3. Object pools uploaded in several parts: a failed part started the next
    part's transfer, whose result was then lost, and the upload never
    started again.
+4. An offline VT partner takes the next matching VT (upstream #870).
 
 Each patch is applied once per library copy (every env has its own under
 .pio/libdeps/<env>/); a patched copy is recognised by the new code. The build fails if the code to
@@ -23,8 +24,12 @@ import pathlib
 
 Import("env")  # noqa: F821 - provided by PlatformIO
 
+VT_CLIENT = "isobus_virtual_terminal_client.cpp"
+NETWORK_MANAGER = "can_network_manager.cpp"
+
 PATCHES = [
     (
+        VT_CLIENT,
         "J.7.9 held repeat",
         """			if ((value1 != ourAuxiliaryInputs.at(auxiliaryInputID).value1) || (value2 != ourAuxiliaryInputs.at(auxiliaryInputID).value2))
 			{""",
@@ -37,6 +42,7 @@ PATCHES = [
 			{""",
     ),
     (
+        VT_CLIENT,
         "J.7.9 status right after enabling",
         """								if (!isInvalidObjectID)
 								{
@@ -58,6 +64,7 @@ PATCHES = [
     # UploadObjectPool and was dropped, so the upload state stayed
     # "in progress" and every later connection waited for it forever.
     (
+        VT_CLIENT,
         "multi-part upload: stop after a failed part",
         "\t\t\t\t\t\t\t\tLOG_ERROR(\"[VT]: An object pool failed to upload. Resetting connection to VT.\");\n"
         "\t\t\t\t\t\t\t\tset_state(StateMachineState::Disconnected);\n",
@@ -68,6 +75,7 @@ PATCHES = [
         "\t\t\t\t\t\t\t\tbreak;\n",
     ),
     (
+        VT_CLIENT,
         "multi-part upload: no stale transfer state",
         "\t\t\t\t\tif (firstTimeInState)\n"
         "\t\t\t\t\t{\n"
@@ -78,18 +86,63 @@ PATCHES = [
         "\t\t\t\t\t\tcurrentObjectPoolState = CurrentObjectPoolUploadState::Uninitialized;\n"
         "\t\t\t\t\t\tif (get_any_pool_needs_scaling())\n",
     ),
+    (
+        NETWORK_MANAGER,
+        "offline partner takes the next matching NAME",
+        "\t\t\tif (nullptr == foundControlFunction)\n"
+        "\t\t\t{\n"
+        "\t\t\t\t// If we still haven't found it, it might be a partner. Check the list of partners.\n"
+        "\t\t\t\tfor (const auto &partner : partneredControlFunctions)\n"
+        "\t\t\t\t{\n"
+        "\t\t\t\t\tif ((partner->get_can_port() == rxFrame.channel) &&\n"
+        "\t\t\t\t\t    (partner->check_matches_name(NAME(claimedNAME))) &&\n"
+        "\t\t\t\t\t    (0 == partner->get_NAME().get_full_name()))\n"
+        "\t\t\t\t\t{\n",
+        "\t\t\t// AgIsoAuxInputs patch: an offline partner takes the next matching NAME\n"
+        "\t\t\tif ((nullptr == foundControlFunction) || (ControlFunction::Type::External == foundControlFunction->get_type()))\n"
+        "\t\t\t{\n"
+        "\t\t\t\t// If we still haven't found it, it might be a partner. Check the list of partners.\n"
+        "\t\t\t\tfor (const auto &partner : partneredControlFunctions)\n"
+        "\t\t\t\t{\n"
+        "\t\t\t\t\tif ((partner->get_can_port() == rxFrame.channel) &&\n"
+        "\t\t\t\t\t    (partner->check_matches_name(NAME(claimedNAME))) &&\n"
+        "\t\t\t\t\t    ((0 == partner->get_NAME().get_full_name()) || !partner->get_address_valid()))\n"
+        "\t\t\t\t\t{\n"
+        "\t\t\t\t\t\tif (nullptr != foundControlFunction)\n"
+        "\t\t\t\t\t\t{\n"
+        "\t\t\t\t\t\t\tinactiveControlFunctions.remove(foundControlFunction);\n"
+        "\t\t\t\t\t\t\tfor (auto &entry : controlFunctionTable[rxFrame.channel])\n"
+        "\t\t\t\t\t\t\t{\n"
+        "\t\t\t\t\t\t\t\tif (entry == foundControlFunction)\n"
+        "\t\t\t\t\t\t\t\t{\n"
+        "\t\t\t\t\t\t\t\t\tentry = nullptr;\n"
+        "\t\t\t\t\t\t\t\t}\n"
+        "\t\t\t\t\t\t\t}\n"
+        "\t\t\t\t\t\t\tfoundControlFunction->address = NULL_CAN_ADDRESS;\n"
+        "\t\t\t\t\t\t}\n"
+        "\t\t\t\t\t\tif (0 != partner->get_NAME().get_full_name())\n"
+        "\t\t\t\t\t\t{\n"
+        "\t\t\t\t\t\t\tLOG_INFO(\"[NM]: Offline partner %016llx replaced by %016llx on channel %u.\",\n"
+        "\t\t\t\t\t\t\t         partner->get_NAME().get_full_name(),\n"
+        "\t\t\t\t\t\t\t         claimedNAME,\n"
+        "\t\t\t\t\t\t\t         rxFrame.channel);\n"
+        "\t\t\t\t\t\t}\n",
+    ),
 ]
 
 
 def patch_library():
     libdeps = pathlib.Path(env.subst("$PROJECT_LIBDEPS_DIR")) / env.subst("$PIOENV")  # noqa: F821
-    sources = list(libdeps.glob("*/isobus/src/isobus_virtual_terminal_client.cpp"))
+    sources = [source for file_name in sorted({patch[0] for patch in PATCHES})
+               for source in libdeps.glob(f"*/isobus/src/{file_name}")]
     if not sources:
         raise SystemExit(f"patch_agisostack: AgIsoStack not found under {libdeps}")
     for source in sources:
         text = source.read_text(encoding="utf-8")
         applied = []
-        for name, old, new in PATCHES:
+        for file_name, name, old, new in PATCHES:
+            if file_name != source.name:
+                continue
             if new in text:
                 continue
             if text.count(old) != 1:
