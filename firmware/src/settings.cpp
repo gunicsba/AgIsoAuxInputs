@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <Preferences.h>
 
+#include "muller.h"
 #include "object_pool/object_pool_ids.h"
 
 static constexpr uint32_t SAVE_DELAY_MS = 2000; // batch NVS writes while editing
@@ -89,6 +90,7 @@ static void onKeyOrButton(const isobus::VirtualTerminalClient::VTKeyEvent &event
     markChanged();
   } else if (event.objectID == BTN_RESTART) {
     save();
+    muller_save();
     Serial.println("[SETTINGS] restarting");
     restartAt = millis() + RESTART_DELAY_MS;
   } else if (event.objectID == BTN_PRESS_FLASH) {

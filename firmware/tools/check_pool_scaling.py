@@ -89,6 +89,11 @@ def parse(data):
             o["font"] = struct.unpack_from("<H", data, i + 8)[0]
             o["text"] = b"255"
             size = 38
+        elif typ == b.TYPE_INPUT_LIST:
+            o["w"], o["h"] = struct.unpack_from("<HH", data, i + 3)
+            n = data[i + 10]
+            o["items"] = struct.unpack_from(f"<{n}H", data, i + 13)
+            size = 13 + 2 * n
         elif typ == b.TYPE_OUTPUT_STRING:
             o["w"], o["h"] = struct.unpack_from("<HH", data, i + 3)
             o["font"] = struct.unpack_from("<H", data, i + 8)[0]
@@ -145,6 +150,10 @@ def check(objs, mask, kw, kh, where):
             inside(oid, kw, kh)
         elif t == b.TYPE_BUTTON:
             inside(oid, o["w"], o["h"])
+        elif t == b.TYPE_INPUT_LIST:
+            for item in o["items"]:
+                if objs[item]["w"] > o["w"] or objs[item]["h"] > o["h"]:
+                    problems.append(f"{where}: item {item} larger than list {oid}")
         text_fits(oid, o)
     return problems
 

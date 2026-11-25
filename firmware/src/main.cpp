@@ -38,6 +38,7 @@
 #include "aux_buttons.h"
 #include "debug_log.h"
 #include "lights.h"
+#include "muller.h"
 #include "object_pool/aux_n_pool_data.h"
 #include "object_pool_adapt.h"
 #include "settings.h"
@@ -208,7 +209,8 @@ static void pollInputsAndReport(bool forceResync) {
     uint8_t port0 = ~pca9555_read(pcaExtAddr, PCA9555_REG_INPUT0);
     uint8_t port1 = ~pca9555_read(pcaExtAddr, PCA9555_REG_INPUT1);
     uint16_t raw = (uint16_t)port0 | ((uint16_t)port1 << 8);
-    aux_buttons_report(raw, forceResync);
+    aux_buttons_report(raw, forceResync); // also switches the page
+    muller_report(raw);
     bool anyChanged = false;
     for (uint8_t i = 0; i < NUM_AUX_BUTTONS; i++) {
       bool pressed = (raw & (1u << i)) != 0;
@@ -456,6 +458,7 @@ static void setupIsobus() {
     vtClient->add_auxiliary_input_object_id(AUX_ANALOG_IDS[i]);
   }
   aux_buttons_setup(vtClient, internalECU, multiPage);
+  muller_create_control_function();
   vtClient->initialize(true);
 }
 
@@ -550,6 +553,8 @@ static void handleDebug() {
            String(twai.msgs_to_tx) + "\n";
   }
   out += "\n";
+  muller_debug_status(out);
+  out += "\n";
   wifi_debug_status(out);
 #if defined(ENABLE_CANLINK_BRIDGE)
   out += "\n";
@@ -615,10 +620,12 @@ void setup() {
   detectExtenderPCA9555();
 
   settings_load(); // the page mode picks the object pool
+  muller_load();
   setupIsobus();
   Serial.println("[AUX-N] ISOBUS stack started, claiming address...");
   lights_setup(vtClient);
   settings_setup(vtClient);
+  muller_setup(vtClient);
 
 #if defined(ENABLE_OTA_WEBSERVER)
   ota_setup(); // Wi-Fi + mDNS, which the bridge needs
@@ -709,6 +716,7 @@ void loop() {
       lastForceResync = now;
     pollInputsAndReport(forceResync);
   }
+  muller_update(); // right after the poll, so repeats follow fresh inputs
   if (now - lastStatusPrint >= STATUS_PRINT_MS) {
     lastStatusPrint = now;
     printStatus();

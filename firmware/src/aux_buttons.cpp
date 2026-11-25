@@ -5,6 +5,7 @@
 #include "debug_log.h"
 #include "isobus/hardware_integration/can_hardware_interface.hpp"
 #include "lights.h"
+#include "muller.h"
 #include "object_pool/object_pool_ids.h"
 
 // Main mask button rectangle colours (VT palette index).
@@ -344,6 +345,9 @@ void aux_buttons_report(uint16_t pressedBits, bool forceResync) {
   if (newlyPressed)
     lights_button_pressed();
 
+  // "Müller only": the inputs still exist, but stay released.
+  const uint16_t auxBits = muller_suppresses_aux_n() ? 0 : pressedBits;
+
   if (multi) {
     for (uint8_t p = 0; p < NUM_PAGES; p++) {
       if ((newlyPressed & (1u << PAGE_SELECT_BITS[p])) && p != currentPage) {
@@ -355,7 +359,7 @@ void aux_buttons_report(uint16_t pressedBits, bool forceResync) {
     size_t n = 0;
     for (uint8_t b = 0; b < NUM_PAGED_BUTTONS; b++) {
       uint8_t bit = PAGED_BUTTON_BITS[b];
-      bool pressed = pressedBits & (1u << bit);
+      bool pressed = auxBits & (1u << bit);
       // Keep a held button on the input it started on, so a page switch or
       // an assignment change mid-press can't leave a function stuck on.
       if (!pressed)
@@ -368,7 +372,7 @@ void aux_buttons_report(uint16_t pressedBits, bool forceResync) {
       sendInput(inputs[n++], false, forceResync);
   } else {
     for (uint8_t i = 0; i < NUM_AUX_BUTTONS; i++)
-      sendInput(inputs[i], pressedBits & (1u << i), forceResync);
+      sendInput(inputs[i], auxBits & (1u << i), forceResync);
   }
 
   for (uint8_t bit = 0; bit < 16; bit++) {

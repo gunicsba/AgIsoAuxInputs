@@ -43,6 +43,14 @@ static const uint16_t AUX_BUTTON_IDS[NUM_AUX_BUTTONS] = {200, 201, 202, 203, 204
 #define PAGE_COLOUR_TEXT_LENGTH 15
 #define PRESS_FLASH_TEXT_LENGTH 16
 
+// Mueller mask
+#define MULLER_MASK 90
+#define KEY_MULLER 92
+#define LIST_MULLER_MODE 96
+#define LIST_MULLER_PAGE 98
+// + PCA9555 bit, for the buttons in JOY_BUTTONS_ON_SCREEN
+#define LIST_MULLER_BUTTON_BASE 150
+
 // Single / multi-page mode
 #define MODEL_ID_SINGLE 1
 #define MODEL_ID_MULTI 2

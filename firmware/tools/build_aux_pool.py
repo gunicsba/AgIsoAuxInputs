@@ -125,6 +125,39 @@ RESTART_HINT_TEXT = b"                        "   # "RESTART TO APPLY" when pend
 PAGE_COLOUR_TEXT = b"PAGE 1: MAGENTA"
 PRESS_FLASH_TEXT = b"PRESS FLASH: ON "
 
+# Müller mask (see src/muller.cpp): the mode and, per button, the Müller
+# joystick function it sends, as input lists whose value is the item index.
+MULLER_MASK = 90
+MULLER_SOFT_KEY_MASK = 91
+KEY_MULLER = 92
+STR_KEY_MULLER = 93
+STR_MULLER_TITLE = 94
+STR_MULLER_HINT = 95
+LIST_MULLER_MODE = 96
+MULLER_FRAME = 97               # drawn behind every list
+LIST_MULLER_PAGE = 98           # multi-page pool: page shown below it
+STR_MULLER_PAGE = 99
+STR_MULLER_MODE_BASE = 110      # + mode 0..2
+STR_MULLER_PAGE_BASE = 113      # + page 0..3
+STR_MULLER_FUNCTION_BASE = 120  # + list index 0..24
+LIST_MULLER_BUTTON_BASE = 150   # + PCA9555 bit
+STR_MULLER_BUTTON_BASE = 170    # + PCA9555 bit
+MULLER_HINT_TEXT = "Mód: újraindítás után érvényes"
+MULLER_PAGE_TEXTS = ["1 (T1)", "2 (T2)", "3 (T3)", "4 (T4)"]
+MULLER_MODE_TEXTS = ["Ki", "Csak Müller", "AUX-N+Müller"]
+# Item 0 = none, item n = function n - 1. At most 12 characters (compact
+# layout); ISO 8859-1 has no o with double acute, so "ö" stands in for it.
+MULLER_FUNCTION_TEXTS = [
+    "nincs",
+    "TRAIL auto", "TRAIL be/ki", "TRAIL B3", "TRAIL B5",           # 0..3
+    "TRAIL B4", "TRAIL B6", "Kormány bal", "Kormány jobb",         # 4..7
+    "Cél 100%", "Fökapcsoló", "Be jobb->bal", "Ki bal->jobb",      # 8..11
+    "Be bal->jobb", "Ki jobb->bal", "Adag -", "Adag +",            # 12..15
+    "Keret auto", "Keret szabad", "Keret fel", "Keret le",         # 16..19
+    "Keret behajt", "Keret kihajt", "B fel, J le", "J fel, B le",  # 20..23
+]
+assert len(MULLER_FUNCTION_TEXTS) == 1 + 24
+
 # --- Single vs multi-page mode ----------------------------------------------
 # Single: every button is one AUX-N input. Multi: T1-T4 select page 1-4
 # (they're not AUX inputs), and every other button has five inputs - one per
@@ -208,6 +241,7 @@ TYPE_SOFT_KEY_MASK = 4
 TYPE_KEY = 5
 TYPE_BUTTON = 6
 TYPE_INPUT_NUMBER = 9
+TYPE_INPUT_LIST = 10
 TYPE_OUTPUT_RECTANGLE = 14
 TYPE_LINE_ATTRIBUTES = 24
 TYPE_FILL_ATTRIBUTES = 25
@@ -298,6 +332,7 @@ FILLER_OBJECT = 65000
 # the pools ship with only the horizontal bits (JUSTIFY_HORIZONTAL_MASK), and
 # every byte that lost a vertical bit is recorded for the firmware to patch
 # back once the connected VT reports version 4+.
+JUSTIFY_LEFT_MIDDLE = 0b0100
 JUSTIFY_CENTERED = 0b0101
 JUSTIFY_RIGHT_MIDDLE = 0b0110
 JUSTIFY_HORIZONTAL_MASK = 0b0011
@@ -385,6 +420,11 @@ FULL = Layout(
                       BTN_PAGE_COLOUR_BASE + 2: (10, 200), BTN_PAGE_COLOUR_BASE + 3: (250, 200),
                       BTN_PRESS_FLASH: (10, 260)},
     restart_hint=(10, 108, 460, 24),
+    muller_title=(6, 4, 100, 24), muller_hint=(6, 84, 460, 24),
+    muller_mode=(46, 34), muller_restart=(250, 20),
+    muller_list=(186, 34),
+    muller_rows=(116, 50, 240, 6, 5, 46),  # first y, pitch, column, label x, label dy, list x
+    muller_label=(36, 24),
 )
 
 # 200x200 (e.g. AMATRON 3): everything in 6x8 except the title, one settings
@@ -410,6 +450,11 @@ COMPACT = Layout(
                       BTN_PAGE_COLOUR_BASE + 2: (4, 116), BTN_PAGE_COLOUR_BASE + 3: (4, 138),
                       BTN_PRESS_FLASH: (4, 160)},
     restart_hint=(4, 60, 192, 10),
+    muller_title=(2, 4, 50, 10), muller_hint=(4, 46, 192, 10),
+    muller_mode=(60, 4), muller_restart=(4, 23),
+    muller_list=(76, 14),
+    muller_rows=(62, 19, 100, 1, 2, 21),
+    muller_label=(18, 10),
 )
 LAYOUTS = (FULL, COMPACT)
 
@@ -668,6 +713,21 @@ def build_input_number(object_id: int, value: int, maximum: int, layout: Layout)
     return o.done()
 
 
+def build_input_list(object_id: int, value: int, item_ids, layout: Layout):
+    # header: ID(2) type(1) width(2) height(2) varRef(2) value(1) nItems(1)
+    # options(1) nMacros(1) = 13 bytes, then one object ID per item
+    o = Obj(object_id, TYPE_INPUT_LIST)
+    o.mask_wh(*layout.muller_list)
+    o.u16(NULL_OBJECT_ID)      # no number variable -> inline value
+    o.u8(value)
+    o.u8(len(item_ids))
+    o.u8(1)                    # options: enabled, no real-time editing (VT4+)
+    o.u8(0)                    # 0 macros
+    for item_id in item_ids:
+        o.u16(item_id)
+    return o.done()
+
+
 def build_output_string(object_id: int, width: int, height: int, font_id: int,
                         bg_colour: int, text: bytes, layout: Layout, justify: int = 0,
                         transparent: bool = False):
@@ -775,6 +835,75 @@ def paged_label(label: str, layer: int):
     return label + ("*" if layer == NUM_PAGES else str(layer + 1))
 
 
+def muller_rows(multi: bool):
+    """(label object, list object) per grid cell: the mapped buttons, in
+    multi-page mode after the page selector and without T1-T4."""
+    rows = [(STR_MULLER_PAGE, LIST_MULLER_PAGE)] if multi else []
+    for label in PAGED_LABELS if multi else JOY_BUTTON_CENTRES:
+        bit = BUTTON_LABELS.index(label)
+        rows.append((STR_MULLER_BUTTON_BASE + bit, LIST_MULLER_BUTTON_BASE + bit))
+    return rows
+
+
+def muller_mask_children(multi: bool, L: Layout):
+    first_y, pitch, column, label_x, label_dy, list_x = L.muller_rows
+    margin = L.frame_margin
+
+    def framed_list(list_id, x, y):
+        # Frame first so the list is drawn on top of it.
+        return [(MULLER_FRAME, x - margin, y - margin), (list_id, x, y)]
+
+    children = [
+        (STR_MULLER_TITLE, *L.muller_title[:2]),
+        (STR_MULLER_HINT, *L.muller_hint[:2]),
+        (BTN_RESTART, *L.muller_restart),
+        *framed_list(LIST_MULLER_MODE, *L.muller_mode),
+    ]
+    cells = muller_rows(multi)
+    rows = (len(cells) + 1) // 2
+    for i, (label_id, list_id) in enumerate(cells):
+        x, y = (i // rows) * column, first_y + (i % rows) * pitch
+        children.append((label_id, x + label_x, y + label_dy))
+        children += framed_list(list_id, x + list_x, y)
+    return children
+
+
+def add_muller_page(pool: Pool, multi: bool, L: Layout):
+    def add_label(object_id, box, text):
+        nonlocal pool
+        pool += build_output_string(object_id, *box, TEST_FONT, COLOUR_WHITE,
+                                    text.encode("iso8859-1"), L)
+
+    add_label(STR_MULLER_TITLE, L.muller_title[2:], "MÜLLER")
+    add_label(STR_MULLER_HINT, L.muller_hint[2:], MULLER_HINT_TEXT)
+    list_w, list_h = L.muller_list
+    pool += build_output_rectangle(MULLER_FRAME, INPUT_FRAME_LINE, list_w + 2 * L.frame_margin,
+                                   list_h + 2 * L.frame_margin)
+    item_lists = [(STR_MULLER_MODE_BASE, MULLER_MODE_TEXTS),
+                  (STR_MULLER_FUNCTION_BASE, MULLER_FUNCTION_TEXTS)]
+    if multi:
+        item_lists.append((STR_MULLER_PAGE_BASE, MULLER_PAGE_TEXTS))
+    for base, texts in item_lists:
+        for i, text in enumerate(texts):
+            pool += build_output_string(base + i, list_w, list_h, TEST_FONT, COLOUR_YELLOW,
+                                        text.encode("iso8859-1"), L,
+                                        justify=JUSTIFY_LEFT_MIDDLE)
+    modes = [STR_MULLER_MODE_BASE + i for i in range(len(MULLER_MODE_TEXTS))]
+    functions = [STR_MULLER_FUNCTION_BASE + i for i in range(len(MULLER_FUNCTION_TEXTS))]
+    pool += build_input_list(LIST_MULLER_MODE, 0, modes, L)
+    if multi:
+        add_label(STR_MULLER_PAGE, L.muller_label, "LAP")
+        pool += build_input_list(LIST_MULLER_PAGE, 0,
+                                 [STR_MULLER_PAGE_BASE + p for p in range(NUM_PAGES)], L)
+    for label in PAGED_LABELS if multi else JOY_BUTTON_CENTRES:
+        bit = BUTTON_LABELS.index(label)
+        add_label(STR_MULLER_BUTTON_BASE + bit, L.muller_label, label)
+        pool += build_input_list(LIST_MULLER_BUTTON_BASE + bit, 0, functions, L)
+    pool += build_key(KEY_MULLER, [(STR_KEY_MULLER, KEY_LABEL_BOX)])
+    pool += build_key_label(STR_KEY_MULLER, KEY_LABEL_BOX, KEY_FONT,
+                            "MÜLLER".encode("iso8859-1"))
+
+
 def build_pool(multi: bool, L: Layout):
     pool = Pool()
     pool += build_working_set()
@@ -836,7 +965,9 @@ def build_pool(multi: bool, L: Layout):
                                 [KEY_LIGHTS_TOGGLE, KEY_LIGHTS_PAGE, KEY_SETTINGS])
     pool += build_soft_key_mask(LIGHTS_SOFT_KEY_MASK,
                                 [KEY_LIGHTS_TOGGLE, KEY_BACK])
-    pool += build_soft_key_mask(SETTINGS_SOFT_KEY_MASK, [KEY_BACK])
+    pool += build_soft_key_mask(SETTINGS_SOFT_KEY_MASK, [KEY_MULLER, KEY_BACK])
+    pool += build_data_mask(MULLER_MASK, MULLER_SOFT_KEY_MASK, muller_mask_children(multi, L))
+    pool += build_soft_key_mask(MULLER_SOFT_KEY_MASK, [KEY_BACK])
     for font_id, size in L.fonts.items():
         pool += build_font_attributes(font_id, size, SCALE_MASK_FONT)
     for font_id, size in KEY_FONTS.items():
@@ -956,6 +1087,7 @@ def build_pool(multi: bool, L: Layout):
     pool += build_input_number(INPUT_GREEN, 255, 255, L)
     pool += build_input_number(INPUT_BLUE, 255, 255, L)
     pool += build_input_number(INPUT_BRIGHTNESS, 50, 100, L)
+    add_muller_page(pool, multi, L)
     check_mask_bounds(pool, L)
     return pool
 
@@ -1053,6 +1185,14 @@ def main():
         f"#define RESTART_HINT_TEXT_LENGTH {len(RESTART_HINT_TEXT)}",
         f"#define PAGE_COLOUR_TEXT_LENGTH {len(PAGE_COLOUR_TEXT)}",
         f"#define PRESS_FLASH_TEXT_LENGTH {len(PRESS_FLASH_TEXT)}",
+        "",
+        "// Mueller mask",
+        f"#define MULLER_MASK {MULLER_MASK}",
+        f"#define KEY_MULLER {KEY_MULLER}",
+        f"#define LIST_MULLER_MODE {LIST_MULLER_MODE}",
+        f"#define LIST_MULLER_PAGE {LIST_MULLER_PAGE}",
+        "// + PCA9555 bit, for the buttons in JOY_BUTTONS_ON_SCREEN",
+        f"#define LIST_MULLER_BUTTON_BASE {LIST_MULLER_BUTTON_BASE}",
         "",
         "// Single / multi-page mode",
         f"#define MODEL_ID_SINGLE {MODEL_ID_SINGLE}",

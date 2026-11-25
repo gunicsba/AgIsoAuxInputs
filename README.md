@@ -77,6 +77,17 @@ The joystick learns what's assigned by reading the VT's assignment commands to t
 
 The main screen also has an AUX designator pointer per button, so the VT can draw the assigned function's icon in it. It's turned off for now (`SHOW_AUX_POINTERS` in `build_aux_pool.py`) while a hang in AgIsoVirtualTerminal's AUX-N build is investigated ([AgIsoVirtualTerminal#252](https://github.com/Open-Agriculture/AgIsoVirtualTerminal/issues/252)).
 
+#### Müller AUX-O output
+
+The joystick can also send a Müller sprayer job computer the messages of the original Müller joystick (AUX-O, "Auxiliary Input Type 1" status). It is off by default. On the VT, open **SETUP**, then the **MÜLLER** soft key:
+
+- The mode at the top: `Ki` (off), `Csak Müller` (Müller only: the AUX-N buttons stay released, the analog axes keep working as AUX-N) or `AUX-N+Müller` (both). Press **RESTART** to apply it.
+- One list per button with the Müller function it sends. Changes apply to the next press. In multi-page mode each page has its own assignment: `LAP` picks the page being edited (pressing T1-T4 on the joystick does too), and T1-T4 themselves can't send a Müller function. A page that was never edited starts with the single-page assignment.
+
+While the mode is on, the board claims a second address with a Müller-like NAME (manufacturer 98, identity `0x1ABCDE`, preferred address 0x90), since the job computer accepts the messages by NAME. Two boards in Müller mode on one bus would share that NAME; the NVS keys `identity` and `sa` (namespace `muller`) override it, but there's no page for them yet.
+
+A held button repeats every 200 ms. If the bus or address is lost, or the repeats stall for over 300 ms, the function is released and stays off until the button is pressed again. `tools/test_muller_sender.cpp` tests that logic on a PC.
+
 The brain board's own PCA9555 and the optocoupler output are not used by this firmware yet.
 
 ## Flash a release
@@ -153,3 +164,5 @@ HARDI and NOVA are trademarks of their respective owners. They are mentioned onl
 2026-10-10 - Firmware: Settings page, single/multi-page AUX-N mode with per-page inputs, LED press flash and page colours, AUX designator pointers (hidden for now)
 
 2026-10-15 - Releases include ready-to-flash firmware images; a blank board can be flashed from the browser with esptool-js
+
+2026-11-25 - Firmware: Müller AUX-O output for Müller sprayer job computers, with a Müller page on the VT
